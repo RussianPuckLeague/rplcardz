@@ -100,7 +100,6 @@ class Database:
 
     async def init_tables(self):
         async with self.pool.acquire() as conn:
-            # 1. Base table creation
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -179,9 +178,17 @@ class Database:
                     code VARCHAR(50),
                     PRIMARY KEY(user_id, code)
                 );
+
+                CREATE TABLE IF NOT EXISTS market_listings (
+                    id SERIAL PRIMARY KEY,
+                    seller_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    card_id INT REFERENCES cards(id) ON DELETE CASCADE,
+                    price BIGINT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
             """)
 
-            # 2. Automated Migrations (updates existing DB columns safely)
+            # Automated Migrations
             await conn.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS player_name VARCHAR(100);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);
@@ -245,6 +252,73 @@ class AdminStartersState(StatesGroup):
 
 class UserPromoState(StatesGroup):
     code = State()
+
+class MarketSellState(StatesGroup):
+    card_id = State()
+    price = State()
+
+class CoinState(StatesGroup):
+    bet = State()
+
+class RpsState(StatesGroup):
+    bet = State()
+
+class SlotsState(StatesGroup):
+    bet = State()
+
+# ==================== HELPER: GRANT STARTER CARDS ====================
+async def grant_starter_cards_for_user(conn, user_id: int):
+    starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
+    starters_list = [dict(s) for s in starters]
+
+    # If fewer than 5 starters are designated, backfill with available cards from DB
+    if len(starters_list) < 5:
+        existing_ids = [s["id"] for s in starters_list]
+        has_goalie = any(s.get("position", "").lower() in ["goalie", "вратарь"] for s in starters_list)
+        if not has_goalie:
+            extra_g = await conn.fetch("""
+                SELECT id, position FROM cards 
+                WHERE (position ILIKE '%goalie%' OR position ILIKE '%врат%')
+                  AND id != ALL($1)
+                ORDER BY ovr ASC LIMIT 1
+            """, existing_ids if existing_ids else [0])
+            if extra_g:
+                starters_list.append(dict(extra_g[0]))
+                existing_ids.append(extra_g[0]["id"])
+
+        needed = 5 - len(starters_list)
+        if needed > 0:
+            extra = await conn.fetch("""
+                SELECT id, position FROM cards 
+                WHERE id != ALL($1)
+                ORDER BY ovr ASC LIMIT $2
+            """, existing_ids if existing_ids else [0], needed)
+            for e in extra:
+                starters_list.append(dict(e))
+
+    skater_slots = ["skater_1", "skater_2", "skater_3", "skater_4"]
+    skater_idx = 0
+    goalie_assigned = False
+
+    for st in starters_list[:5]:
+        pos = st.get("position", "")
+        if ("goalie" in pos.lower() or "врат" in pos.lower()) and not goalie_assigned:
+            slot_name = "goalie"
+            goalie_assigned = True
+        elif skater_idx < len(skater_slots):
+            slot_name = skater_slots[skater_idx]
+            skater_idx += 1
+        elif not goalie_assigned:
+            slot_name = "goalie"
+            goalie_assigned = True
+        else:
+            slot_name = None
+
+        await conn.execute("""
+            INSERT INTO user_cards (user_id, card_id, in_lineup, slot)
+            VALUES ($1, $2, TRUE, $3)
+            ON CONFLICT (user_id, card_id) DO UPDATE SET in_lineup = TRUE, slot = COALESCE(user_cards.slot, EXCLUDED.slot)
+        """, user_id, st["id"], slot_name)
 
 # ==================== MATCH ENGINE & QUEUE ====================
 class MatchQueue:
@@ -395,8 +469,10 @@ def main_menu_keyboard(is_private: bool = True) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚔️ Начать поиск игры", callback_data="search_game")],
         [InlineKeyboardButton(text="🔍 Найти карточку", callback_data="claim_daily_btn"),
          InlineKeyboardButton(text="💼 Работы", callback_data="jobs_menu")],
-        [InlineKeyboardButton(text="🏒 Состав (4+1)", callback_data="view_roster")],
-        [InlineKeyboardButton(text="🎁 Ежедневные призы (7 дней)", callback_data="streak_rewards")],
+        [InlineKeyboardButton(text="🏒 Состав (4+1)", callback_data="view_roster"),
+         InlineKeyboardButton(text="🏪 Рынок карточек", callback_data="market_menu")],
+        [InlineKeyboardButton(text="🎁 Ежедневные призы", callback_data="streak_rewards"),
+         InlineKeyboardButton(text="🎰 Казино", callback_data="casino_menu")],
         [InlineKeyboardButton(text="📦 Магазин паков", callback_data="pack_shop"),
          InlineKeyboardButton(text="🏆 Рейтинг MMR", callback_data="leaderboard_mmr")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo")]
@@ -452,6 +528,14 @@ def merch_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")]
     ])
 
+def casino_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🦅 Орёл и Решка (/coin)", callback_data="casino_coin")],
+        [InlineKeyboardButton(text="✂️ Камень-Ножницы-Бумага (/rps)", callback_data="casino_rps")],
+        [InlineKeyboardButton(text="🎰 Слоты (/slots)", callback_data="casino_slots")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+
 # ==================== HELPER: GET USER STATS & ROSTER 4+1 ====================
 async def get_user_roster_ovr(user_id: int) -> Tuple[int, Dict[str, Optional[dict]], List[dict]]:
     async with db.pool.acquire() as conn:
@@ -468,12 +552,10 @@ async def get_user_roster_ovr(user_id: int) -> Tuple[int, Dict[str, Optional[dic
     all_cards = [dict(r) for r in all_cards_records]
     lineup_dict: Dict[str, Optional[dict]] = {slot: None for slot in ROSTER_SLOTS}
 
-    # Populate explicit slots
     for c in all_cards:
         if c.get("slot") in lineup_dict and lineup_dict[c["slot"]] is None:
             lineup_dict[c["slot"]] = c
 
-    # Auto-fill empty slots if user just started and slots aren't explicitly assigned
     used_ids = {c["id"] for c in lineup_dict.values() if c}
     for slot in ["skater_1", "skater_2", "skater_3", "skater_4"]:
         if lineup_dict[slot] is None:
@@ -528,6 +610,10 @@ async def cmd_start(message: Message, state: FSMContext):
         if user and user["team_name"]:
             async with db.pool.acquire() as conn:
                 await conn.execute("UPDATE users SET player_name = $1, username = $2 WHERE user_id = $3", user_name, username, user_id)
+                # Auto-check if user was shortchanged of starter cards (< 5 cards in total)
+                c_cnt = await conn.fetchval("SELECT COUNT(*) FROM user_cards WHERE user_id = $1", user_id)
+                if c_cnt < 5:
+                    await grant_starter_cards_for_user(conn, user_id)
                 user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
             is_private = (message.chat.type == ChatType.PRIVATE)
@@ -576,29 +662,15 @@ async def process_country_choice(callback: CallbackQuery, state: FSMContext):
             ON CONFLICT (user_id) DO UPDATE SET team_name = $2, country = $3, player_name = $4, username = $5
         """, user_id, team_name, country, player_name, username)
 
-        # Grant starter cards
-        starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
-        skater_count = 0
-        for st in starters:
-            slot_name = None
-            if st["position"] == "Skater" and skater_count < 4:
-                skater_count += 1
-                slot_name = f"skater_{skater_count}"
-            elif st["position"] == "Goalie":
-                slot_name = "goalie"
-
-            await conn.execute("""
-                INSERT INTO user_cards (user_id, card_id, in_lineup, slot)
-                VALUES ($1, $2, TRUE, $3)
-                ON CONFLICT (user_id, card_id) DO NOTHING
-            """, user_id, st["id"], slot_name)
-
+        # Grant full set of 5 starter cards
+        await grant_starter_cards_for_user(conn, user_id)
         user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
     await state.clear()
     profile_text = render_profile_text(user, player_name)
     await callback.message.edit_text(
-        f"🎉 <b>Команда успешно зарегистрирована!</b>\n\n{profile_text}",
+        f"🎉 <b>Команда успешно зарегистрирована!</b>\n"
+        f"Вам выданы 5 стартовых карточек полного звена (4 полевых + 1 вратарь)!\n\n{profile_text}",
         reply_markup=main_menu_keyboard(callback.message.chat.type == ChatType.PRIVATE),
         parse_mode=ParseMode.HTML
     )
@@ -637,12 +709,10 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
                 minutes, _ = divmod(rem, 60)
                 return False, f"⏳ Карточка уже открывалась! До следующей попытки осталось: <b>{hours}ч {minutes}м</b>.", None
 
-        # 5% chance to find "Ничего"
         if random.random() < 0.05:
             await conn.execute("UPDATE users SET last_daily_claim = $1, notified_cd = FALSE WHERE user_id = $2", now, user_id)
             return True, "💨 <b>Вам выпало:</b> Ничего!\nУвы, удача отвернулась в этот раз. Возвращайтесь через 12 часов!", None
 
-        # Rarity chances
         r = random.random()
         cumulative = 0.0
         chosen_rarity = "Редкая"
@@ -652,7 +722,6 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
                 chosen_rarity = rarity
                 break
 
-        # Rule: NO DUPLICATE CARDS. Fetch effective photo from card OR its team!
         available_cards = await conn.fetch("""
             SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
             FROM cards c
@@ -742,7 +811,6 @@ async def card_cooldown_notifier():
                             parse_mode=ParseMode.HTML
                         )
                         await conn.execute("UPDATE users SET notified_cd = TRUE WHERE user_id = $1", u_id)
-                        logger.info(f"Cooldown notification sent to user {u_id}")
                     except Exception as send_err:
                         logger.warning(f"Failed to send cooldown notification to {u_id}: {send_err}")
                         await conn.execute("UPDATE users SET notified_cd = TRUE WHERE user_id = $1", u_id)
@@ -783,8 +851,6 @@ async def cb_streak_rewards(callback: CallbackQuery):
                 streak_to_claim = 1
 
         reward_info = STREAK_REWARDS[streak_to_claim]
-        reward_desc = reward_info["desc"]
-
         if reward_info["type"] == "coins":
             await conn.execute("""
                 UPDATE users 
@@ -835,7 +901,7 @@ async def cb_streak_rewards(callback: CallbackQuery):
     else:
         await callback.message.edit_text(schedule_text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-# ==================== ROSTER 4+1 (VIEW IN GROUP, EDIT BY POSITION IN PM) ====================
+# ==================== ROSTER 4+1 ====================
 @dp.callback_query(F.data == "view_roster")
 async def cb_view_roster(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -917,6 +983,636 @@ async def cb_set_slot(callback: CallbackQuery):
 
     await cb_view_roster(callback)
 
+# ==================== MARKETPLACE / ТОРГОВАЯ ПЛОЩАДКА ====================
+@dp.message(Command("market"))
+async def cmd_market(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Купить карточки", callback_data="market_browse:0")],
+        [InlineKeyboardButton(text="🏷 Выставить карточку на продажу", callback_data="market_sell_list")],
+        [InlineKeyboardButton(text="📦 Мои лоты на продаже", callback_data="market_my_listings")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await message.answer(
+        "🏪 <b>ТОРГОВАЯ ПЛОЩАДКА RPL</b>\n\n"
+        "Здесь игроки могут свободно покупать и продавать любые карточки за RPLCoin!\n\n"
+        "Выберите раздел:",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data == "market_menu")
+async def cb_market_menu(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Купить карточки", callback_data="market_browse:0")],
+        [InlineKeyboardButton(text="🏷 Выставить карточку на продажу", callback_data="market_sell_list")],
+        [InlineKeyboardButton(text="📦 Мои лоты на продаже", callback_data="market_my_listings")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    text = (
+        "🏪 <b>ТОРГОВАЯ ПЛОЩАДКА RPL</b>\n\n"
+        "Здесь игроки могут свободно покупать и продавать любые карточки за RPLCoin!\n\n"
+        "Выберите раздел:"
+    )
+    if callback.message.photo:
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("market_browse:"))
+async def cb_market_browse(callback: CallbackQuery):
+    page = int(callback.data.split(":")[1])
+    page_size = 5
+    offset = page * page_size
+
+    async with db.pool.acquire() as conn:
+        listings = await conn.fetch("""
+            SELECT m.id as listing_id, m.price, m.seller_id, 
+                   c.name, c.ovr, c.rarity, c.position, c.team_name,
+                   u.player_name, u.team_name as seller_team
+            FROM market_listings m
+            JOIN cards c ON m.card_id = c.id
+            JOIN users u ON m.seller_id = u.user_id
+            WHERE m.seller_id != $1
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """, callback.from_user.id, page_size + 1, offset)
+
+    has_next = len(listings) > page_size
+    current_listings = listings[:page_size]
+
+    if not current_listings:
+        text = "🛒 <b>ТОРГОВАЯ ПЛОЩАДКА — ЛОТЫ</b>\n\nНа данный момент активных лотов от других игроков нет."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷 Выставить свою карту", callback_data="market_sell_list")],
+            [InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    text = f"🛒 <b>ТОРГОВАЯ ПЛОЩАДКА (Стр. {page + 1})</b>\nНажмите на лот для покупки:\n\n"
+    buttons = []
+    for l in current_listings:
+        btn_title = f"{l['name']} (OVR {l['ovr']}) — 💰 {l['price']} RPL"
+        buttons.append([InlineKeyboardButton(text=btn_title, callback_data=f"market_view:{l['listing_id']}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"market_browse:{page - 1}"))
+    if has_next:
+        nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"market_browse:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("market_view:"))
+async def cb_market_view(callback: CallbackQuery):
+    listing_id = int(callback.data.split(":")[1])
+    async with db.pool.acquire() as conn:
+        item = await conn.fetchrow("""
+            SELECT m.id as listing_id, m.price, m.seller_id, m.card_id,
+                   c.name, c.ovr, c.rarity, c.position, c.team_name, c.country,
+                   COALESCE(c.photo_id, t.photo_id) AS effective_photo,
+                   u.player_name, u.team_name as seller_team
+            FROM market_listings m
+            JOIN cards c ON m.card_id = c.id
+            LEFT JOIN teams t ON c.team_name = t.name
+            JOIN users u ON m.seller_id = u.user_id
+            WHERE m.id = $1
+        """, listing_id)
+
+    if not item:
+        await callback.answer("Этот лот уже продан или снят с продажи!", show_alert=True)
+        return
+
+    text = (
+        f"🏷 <b>ЛОТ #{item['listing_id']}</b>\n\n"
+        f"🌟 <b>{html.escape(item['name'])}</b> (OVR: {item['ovr']})\n"
+        f"Позиция: <b>{html.escape(item['position'])}</b> | Редкость: <b>{html.escape(item['rarity'])}</b>\n"
+        f"Команда игрока: <b>{html.escape(item['team_name'])}</b> | Страна: <b>{html.escape(item['country'])}</b>\n\n"
+        f"👤 Продавец: <b>{html.escape(item['player_name'] or 'Хоккеист')}</b> ({html.escape(item['seller_team'] or 'RPL')})\n"
+        f"💰 Цена: <b>{item['price']} RPLCoin</b>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Купить за {item['price']} RPL", callback_data=f"market_buy:{item['listing_id']}")],
+        [InlineKeyboardButton(text="🔙 К списку лотов", callback_data="market_browse:0")]
+    ])
+
+    if item["effective_photo"]:
+        await callback.message.delete()
+        await callback.message.answer_photo(photo=item["effective_photo"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("market_buy:"))
+async def cb_market_buy(callback: CallbackQuery):
+    listing_id = int(callback.data.split(":")[1])
+    buyer_id = callback.from_user.id
+
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            listing = await conn.fetchrow("SELECT * FROM market_listings WHERE id = $1 FOR UPDATE", listing_id)
+            if not listing:
+                await callback.answer("❌ Лот больше недоступен!", show_alert=True)
+                return
+
+            if listing["seller_id"] == buyer_id:
+                await callback.answer("❌ Вы не можете купить собственную карточку!", show_alert=True)
+                return
+
+            buyer = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1 FOR UPDATE", buyer_id)
+            price = listing["price"]
+
+            if buyer["rpl_coins"] < price:
+                await callback.answer(f"❌ Недостаточно средств! Нужно: {price} RPL, у вас: {buyer['rpl_coins']} RPL.", show_alert=True)
+                return
+
+            # Check if buyer already owns this card
+            has_card = await conn.fetchrow("SELECT 1 FROM user_cards WHERE user_id = $1 AND card_id = $2", buyer_id, listing["card_id"])
+            if has_card:
+                await callback.answer("❌ У вас уже есть эта карточка в коллекции!", show_alert=True)
+                return
+
+            # Execute transaction
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", price, buyer_id)
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", price, listing["seller_id"])
+            await conn.execute("DELETE FROM market_listings WHERE id = $1", listing_id)
+            await conn.execute("INSERT INTO user_cards (user_id, card_id, in_lineup) VALUES ($1, $2, FALSE)", buyer_id, listing["card_id"])
+
+    # Notify seller
+    try:
+        await bot.send_message(
+            chat_id=listing["seller_id"],
+            text=f"🎉 <b>Ваша карточка успешно продана на рынке!</b>\nНа ваш баланс зачислено: <b>+{price} RPLCoin</b>!",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+    await callback.answer("🎉 Карточка успешно куплена и добавлена в вашу коллекцию!", show_alert=True)
+    await cb_market_browse(callback)
+
+# --- Selling flow ---
+@dp.callback_query(F.data == "market_sell_list")
+async def cb_market_sell_list(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with db.pool.acquire() as conn:
+        user_cards = await conn.fetch("""
+            SELECT c.*, uc.id as user_card_id, uc.slot
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = $1
+            ORDER BY c.ovr DESC
+        """, user_id)
+
+    if not user_cards:
+        await callback.answer("У вас нет карточек для продажи!", show_alert=True)
+        return
+
+    text = "🏷 <b>ВЫСТАВЛЕНИЕ КАРТОЧКИ НА РЫНОК</b>\n\nВыберите карточку, которую хотите продать:"
+    buttons = []
+    for c in user_cards:
+        slot_str = f" [{SLOT_NAMES.get(c['slot'], '')}]" if c['slot'] else ""
+        btn_text = f"{c['name']} (OVR {c['ovr']}, {c['rarity']}){slot_str}"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"market_select_card:{c['id']}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("market_select_card:"))
+async def cb_market_select_card(callback: CallbackQuery, state: FSMContext):
+    card_id = int(callback.data.split(":")[1])
+    await state.update_data(sell_card_id=card_id)
+    await state.set_state(MarketSellState.price)
+
+    async with db.pool.acquire() as conn:
+        card = await conn.fetchrow("SELECT name, ovr, rarity FROM cards WHERE id = $1", card_id)
+
+    await callback.message.edit_text(
+        f"🏷 Продажа карточки: <b>{html.escape(card['name'])}</b> (OVR {card['ovr']}, {card['rarity']})\n\n"
+        f"Введите <b>цену в RPLCoin</b>, за которую хотите выставить эту карточку:\n"
+        f"<i>(Вы можете указать любую желаемую сумму от 100 RPL)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="market_menu")]])
+    )
+
+@dp.message(MarketSellState.price)
+async def process_market_price(message: Message, state: FSMContext):
+    val = message.text.strip()
+    if not val.isdigit() or int(val) < 100:
+        await message.answer("❌ Введите корректную сумму в RPLCoin (минимум 100):")
+        return
+
+    price = int(val)
+    data = await state.get_data()
+    card_id = data.get("sell_card_id")
+    user_id = message.from_user.id
+
+    async with db.pool.acquire() as conn:
+        # Check ownership
+        uc = await conn.fetchrow("SELECT id FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, card_id)
+        if not uc:
+            await message.answer("❌ Карточка не найдена у вас в инвентаре!")
+            await state.clear()
+            return
+
+        # Remove from user's lineup & cards to hold in market
+        await conn.execute("DELETE FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, card_id)
+        await conn.execute("INSERT INTO market_listings (seller_id, card_id, price) VALUES ($1, $2, $3)", user_id, card_id, price)
+        card = await conn.fetchrow("SELECT name, ovr FROM cards WHERE id = $1", card_id)
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏪 На рынок", callback_data="market_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await message.answer(
+        f"✅ Карточка <b>{html.escape(card['name'])}</b> (OVR {card['ovr']}) выставлена на продажу за <b>{price} RPLCoin</b>!\n\n"
+        f"Когда другой игрок приобретет ее, вам автоматически начислятся средства.",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
+
+# --- My listings ---
+@dp.callback_query(F.data == "market_my_listings")
+async def cb_market_my_listings(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with db.pool.acquire() as conn:
+        my_items = await conn.fetch("""
+            SELECT m.id as listing_id, m.price, c.name, c.ovr, c.rarity, c.id as card_id
+            FROM market_listings m
+            JOIN cards c ON m.card_id = c.id
+            WHERE m.seller_id = $1
+            ORDER BY m.created_at DESC
+        """, user_id)
+
+    if not my_items:
+        text = "📦 <b>МОИ ЛОТЫ НА ПРОДАЖЕ</b>\n\nУ вас сейчас нет активных лотов на рынке."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷 Выставить карту", callback_data="market_sell_list")],
+            [InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        return
+
+    text = "📦 <b>МОИ ЛОТЫ НА ПРОДАЖЕ</b>\nНажмите на лот, чтобы снять его с продажи и вернуть карту:\n\n"
+    buttons = []
+    for it in my_items:
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ Снять: {it['name']} ({it['ovr']}) — {it['price']} RPL",
+            callback_data=f"market_cancel:{it['listing_id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("market_cancel:"))
+async def cb_market_cancel(callback: CallbackQuery):
+    listing_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+
+    async with db.pool.acquire() as conn:
+        item = await conn.fetchrow("DELETE FROM market_listings WHERE id = $1 AND seller_id = $2 RETURNING card_id", listing_id, user_id)
+        if item:
+            await conn.execute("INSERT INTO user_cards (user_id, card_id, in_lineup) VALUES ($1, $2, FALSE)", user_id, item["card_id"])
+
+    await callback.answer("Карточка возвращена в вашу коллекцию!", show_alert=True)
+    await cb_market_my_listings(callback)
+
+# ==================== CASINO / КАЗИНО ====================
+@dp.callback_query(F.data == "casino_menu")
+async def cb_casino_menu(callback: CallbackQuery):
+    text = (
+        "🎰 <b>ХОККЕЙНОЕ КАЗИНО RPL</b>\n\n"
+        "Испытайте свою удачу и приумножьте баланс RPLCoin!\n\n"
+        "🦅 <b>Орёл и Решка (/coin)</b>\n"
+        "• Шанс на победу: <b>20%</b>\n"
+        "• Выигрыш: <b>ставка × 4</b>\n\n"
+        "✂️ <b>Камень-Ножницы-Бумага (/rps)</b>\n"
+        "• Победа (42%): +ставка\n"
+        "• Ничья (16%): ставка возвращается\n"
+        "• Поражение (42%): -ставка\n\n"
+        "🎰 <b>Слоты (/slots)</b>\n"
+        "• Символы: 🏒 🥅 ⭐️ 🍒 7️⃣ 💎\n"
+        "• 3 редких (7️⃣/💎/⭐️) [3%]: <b>множитель x10</b>\n"
+        "• 3 любых одинаковых [7%]: <b>множитель x5</b>\n"
+        "• 2 одинаковых [15%]: <b>множитель x2</b>\n"
+        "• Проигрыш [75%]\n\n"
+        "Выберите игру:"
+    )
+    if callback.message.photo:
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=casino_menu_keyboard(), parse_mode=ParseMode.HTML)
+    else:
+        await callback.message.edit_text(text, reply_markup=casino_menu_keyboard(), parse_mode=ParseMode.HTML)
+
+# --- 1. Eagle & Tails (/coin) ---
+@dp.callback_query(F.data == "casino_coin")
+async def cb_casino_coin(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CoinState.bet)
+    await callback.message.edit_text(
+        "🦅 <b>ОРЁЛ И РЕШКА (/coin)</b>\n\n"
+        "Введите сумму ставки в RPLCoin:\n"
+        "<i>Шанс победы: 20% | Множитель: x4</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+    )
+
+@dp.message(Command("coin"))
+async def cmd_coin(message: Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        bet = int(args[1])
+        await process_coin_bet_value(message, state, bet)
+    else:
+        await state.set_state(CoinState.bet)
+        await message.answer(
+            "🦅 <b>ОРЁЛ И РЕШКА</b>\n\nВведите сумму ставки в RPLCoin:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        )
+
+@dp.message(CoinState.bet)
+async def process_coin_bet_input(message: Message, state: FSMContext):
+    if not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        await message.answer("❌ Введите корректную ставку (число больше нуля):")
+        return
+    await process_coin_bet_value(message, state, int(message.text.strip()))
+
+async def process_coin_bet_value(message: Message, state: FSMContext, bet: int):
+    user_id = message.from_user.id
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1", user_id)
+        if not user or user["rpl_coins"] < bet:
+            await message.answer(f"❌ Недостаточно средств! Ваш баланс: {user['rpl_coins'] if user else 0} RPL.")
+            await state.clear()
+            return
+
+    await state.update_data(bet=bet)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🦅 Орёл", callback_data="coin_side:eagle"),
+            InlineKeyboardButton(text="🪙 Решка", callback_data="coin_side:tails")
+        ],
+        [InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]
+    ])
+    await message.answer(f"💰 Ставка: <b>{bet} RPLCoin</b>.\nВыберите сторону монеты:", reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("coin_side:"))
+async def cb_coin_play(callback: CallbackQuery, state: FSMContext):
+    choice = callback.data.split(":")[1]
+    choice_str = "🦅 Орёл" if choice == "eagle" else "🪙 Решка"
+    data = await state.get_data()
+    bet = data.get("bet")
+    user_id = callback.from_user.id
+
+    if not bet:
+        await callback.answer("Ставка не найдена, начните заново!", show_alert=True)
+        return
+
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1", user_id)
+        if user["rpl_coins"] < bet:
+            await callback.answer("Недостаточно средств на балансе!", show_alert=True)
+            await state.clear()
+            return
+
+        is_win = (random.random() < 0.20)
+        actual_side = choice if is_win else ("tails" if choice == "eagle" else "eagle")
+        actual_str = "🦅 Орёл" if actual_side == "eagle" else "🪙 Решка"
+
+        if is_win:
+            winnings = bet * 4
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", winnings, user_id)
+            res_text = (
+                f"🪙 <b>РЕЗУЛЬТАТ БРОСКА:</b> {actual_str}!\n"
+                f"Ваш выбор: <b>{choice_str}</b>\n\n"
+                f"🎉 <b>ПОБЕДА!</b> Шанс 20% сработал!\n"
+                f"💰 Начислено: <b>+{winnings} RPLCoin</b> (ставка x4)!"
+            )
+        else:
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", bet, user_id)
+            res_text = (
+                f"🪙 <b>РЕЗУЛЬТАТ БРОСКА:</b> {actual_str}!\n"
+                f"Ваш выбор: <b>{choice_str}</b>\n\n"
+                f"😢 <b>ПОРАЖЕНИЕ!</b>\n"
+                f"💸 Списано: <b>-{bet} RPLCoin</b>."
+            )
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сыграть снова", callback_data="casino_coin")],
+        [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
+    ])
+    await callback.message.edit_text(res_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+# --- 2. Rock Paper Scissors (/rps) ---
+@dp.callback_query(F.data == "casino_rps")
+async def cb_casino_rps(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RpsState.bet)
+    await callback.message.edit_text(
+        "✂️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА (/rps)</b>\n\n"
+        "Введите сумму ставки в RPLCoin:\n"
+        "<i>Шансы: 42% победа (+ставка) | 16% ничья | 42% поражение (-ставка)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+    )
+
+@dp.message(Command("rps"))
+async def cmd_rps(message: Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        await process_rps_bet_value(message, state, int(args[1]))
+    else:
+        await state.set_state(RpsState.bet)
+        await message.answer(
+            "✂️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА</b>\n\nВведите сумму ставки в RPLCoin:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        )
+
+@dp.message(RpsState.bet)
+async def process_rps_bet_input(message: Message, state: FSMContext):
+    if not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        await message.answer("❌ Введите корректную ставку (число больше нуля):")
+        return
+    await process_rps_bet_value(message, state, int(message.text.strip()))
+
+async def process_rps_bet_value(message: Message, state: FSMContext, bet: int):
+    user_id = message.from_user.id
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1", user_id)
+        if not user or user["rpl_coins"] < bet:
+            await message.answer(f"❌ Недостаточно средств! Ваш баланс: {user['rpl_coins'] if user else 0} RPL.")
+            await state.clear()
+            return
+
+    await state.update_data(bet=bet)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🪨 Камень", callback_data="rps_choice:rock"),
+            InlineKeyboardButton(text="✂️ Ножницы", callback_data="rps_choice:scissors"),
+            InlineKeyboardButton(text="📄 Бумага", callback_data="rps_choice:paper")
+        ],
+        [InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]
+    ])
+    await message.answer(f"💰 Ставка: <b>{bet} RPLCoin</b>.\nСделайте ваш ход:", reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("rps_choice:"))
+async def cb_rps_play(callback: CallbackQuery, state: FSMContext):
+    user_choice = callback.data.split(":")[1]
+    data = await state.get_data()
+    bet = data.get("bet")
+    user_id = callback.from_user.id
+
+    if not bet:
+        await callback.answer("Ставка не найдена, начните заново!", show_alert=True)
+        return
+
+    choice_names = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+    beaten_by = {"rock": "paper", "scissors": "rock", "paper": "scissors"}
+    beats = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+
+    roll = random.random()
+    if roll < 0.42:
+        outcome = "win"
+        bot_choice = beats[user_choice]
+    elif roll < 0.58:
+        outcome = "draw"
+        bot_choice = user_choice
+    else:
+        outcome = "lose"
+        bot_choice = beaten_by[user_choice]
+
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1", user_id)
+        if user["rpl_coins"] < bet:
+            await callback.answer("Недостаточно средств на балансе!", show_alert=True)
+            await state.clear()
+            return
+
+        if outcome == "win":
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", bet, user_id)
+            res_str = f"🎉 <b>ПОБЕДА!</b> (+{bet} RPLCoin)"
+        elif outcome == "draw":
+            res_str = "🤝 <b>НИЧЬЯ!</b> Ставка возвращается."
+        else:
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", bet, user_id)
+            res_str = f"😢 <b>ПОРАЖЕНИЕ!</b> (-{bet} RPLCoin)"
+
+    text = (
+        f"✂️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА</b>\n\n"
+        f"Ваш выбор: <b>{choice_names[user_choice]}</b>\n"
+        f"Выбор дилера: <b>{choice_names[bot_choice]}</b>\n\n"
+        f"{res_str}"
+    )
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сыграть снова", callback_data="casino_rps")],
+        [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+# --- 3. Slots (/slots) ---
+@dp.callback_query(F.data == "casino_slots")
+async def cb_casino_slots(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SlotsState.bet)
+    await callback.message.edit_text(
+        "🎰 <b>ХОККЕЙНЫЕ СЛОТЫ (/slots)</b>\n\n"
+        "Символы: 🏒 🥅 ⭐️ 🍒 7️⃣ 💎\n\n"
+        "Шансы выигрыша:\n"
+        "• 3 редких (7️⃣/💎/⭐️) [3%] — <b>множитель x10</b>\n"
+        "• 3 любых одинаковых [7%] — <b>множитель x5</b>\n"
+        "• 2 одинаковых символа [15%] — <b>множитель x2</b>\n"
+        "• Проигрыш [75%]\n\n"
+        "Введите сумму ставки:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+    )
+
+@dp.message(Command("slots"))
+async def cmd_slots(message: Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) > 1 and args[1].isdigit():
+        await run_slots_spin(message, int(args[1]))
+    else:
+        await state.set_state(SlotsState.bet)
+        await message.answer(
+            "🎰 <b>СЛОТЫ</b>\n\nВведите сумму ставки в RPLCoin:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        )
+
+@dp.message(SlotsState.bet)
+async def process_slots_bet(message: Message, state: FSMContext):
+    if not message.text.strip().isdigit() or int(message.text.strip()) <= 0:
+        await message.answer("❌ Введите корректную ставку (число больше нуля):")
+        return
+    await state.clear()
+    await run_slots_spin(message, int(message.text.strip()))
+
+async def run_slots_spin(message: Message, bet: int):
+    user_id = message.from_user.id
+    rare_symbols = ["7️⃣", "💎", "⭐️"]
+    common_symbols = ["🏒", "🥅", "🍒"]
+    all_symbols = ["🏒", "🥅", "⭐️", "🍒", "7️⃣", "💎"]
+
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT rpl_coins FROM users WHERE user_id = $1", user_id)
+        if not user or user["rpl_coins"] < bet:
+            await message.answer(f"❌ Недостаточно средств! Ваш баланс: {user['rpl_coins'] if user else 0} RPL.")
+            return
+
+        # Deduct bet immediately
+        await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", bet, user_id)
+
+        roll = random.random()
+        if roll < 0.03: # 3% Rare triple x10
+            sym = random.choice(rare_symbols)
+            reels = [sym, sym, sym]
+            multiplier = 10
+        elif roll < 0.10: # 7% Any triple x5 (0.03 + 0.07 = 0.10)
+            sym = random.choice(common_symbols)
+            reels = [sym, sym, sym]
+            multiplier = 5
+        elif roll < 0.25: # 15% Two matching x2 (0.10 + 0.15 = 0.25)
+            sym = random.choice(all_symbols)
+            other = random.choice([x for x in all_symbols if x != sym])
+            reels = [sym, sym, other]
+            random.shuffle(reels)
+            multiplier = 2
+        else: # 75% Loss
+            reels = random.sample(all_symbols, 3)
+            multiplier = 0
+
+        payout = bet * multiplier
+        if payout > 0:
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", payout, user_id)
+
+    reels_display = f"🎰 [ {reels[0]} | {reels[1]} | {reels[2]} ] 🎰"
+    if multiplier > 0:
+        res_str = (
+            f"🎉 <b>ДЖЕКПОТ! МНОЖИТЕЛЬ x{multiplier}!</b>\n"
+            f"💰 Выигрыш: <b>+{payout} RPLCoin</b>!"
+        )
+    else:
+        res_str = (
+            f"😢 <b>Не повезло!</b>\n"
+            f"💸 Списана ставка: <b>-{bet} RPLCoin</b>."
+        )
+
+    text = (
+        f"🎰 <b>КРУТИМ БАРАБАНЫ...</b>\n\n"
+        f"{reels_display}\n\n"
+        f"{res_str}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Крутить снова", callback_data="casino_slots")],
+        [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
 # ==================== JOBS SYSTEM ====================
 async def check_jail(user_id: int) -> Tuple[bool, str]:
     now = datetime.utcnow()
@@ -969,7 +1665,6 @@ async def cb_job_coach(callback: CallbackQuery):
                 await callback.answer(f"⏳ Тренировка еще не окончена! Ждите {h}ч {m}м.", show_alert=True)
                 return
 
-        # 40% success rate
         is_success = (random.random() < 0.40)
         await conn.execute("UPDATE users SET job_coach_cd = $1 WHERE user_id = $2", now, user_id)
 
@@ -1385,7 +2080,7 @@ async def run_ai_game_session(player1: dict):
     }
     await run_game_session(player1, ai_team, is_pvp=False)
 
-# ==================== LEADERBOARD (MMR WITH USERNAME, WINS/LOSSES) ====================
+# ==================== LEADERBOARD ====================
 @dp.callback_query(F.data == "leaderboard_mmr")
 async def cb_leaderboard(callback: CallbackQuery):
     async with db.pool.acquire() as conn:
@@ -1572,7 +2267,7 @@ async def cb_adm_starters(callback: CallbackQuery, state: FSMContext):
     else:
         st_text += "Стартовых игроков еще не назначено.\n"
 
-    st_text += "\nОтправьте <b>ID карточек через запятую</b>, которые будут стартовым набором для всех новичков:\n<i>Пример: 1, 2, 3, 4, 5</i>"
+    st_text += "\nОтправьте <b>ID 5 карточек через запятую</b> (4 полевых и 1 вратарь), которые будут стартовым набором:\n<i>Пример: 1, 2, 3, 4, 5</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]])
     await callback.message.edit_text(st_text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -1584,7 +2279,7 @@ async def process_starters_ids(message: Message, state: FSMContext):
         if not ids:
             raise ValueError()
     except Exception:
-        await message.answer("❌ Неверный формат! Отправьте список ID через запятую (например: 1, 4, 8, 12):")
+        await message.answer("❌ Неверный формат! Отправьте список ID через запятую (например: 1, 4, 8, 12, 15):")
         return
 
     async with db.pool.acquire() as conn:
@@ -1595,12 +2290,12 @@ async def process_starters_ids(message: Message, state: FSMContext):
     await state.clear()
     res_list = "\n".join([f"• #{c['id']} {c['name']} (OVR {c['ovr']}, {c['position']})" for c in updated])
     await message.answer(
-        f"✅ <b>Стартовые карточки успешно обновлены!</b>\n\n{res_list}\n\nТеперь все новые игроки будут получать этот набор!",
+        f"✅ <b>Стартовые карточки успешно обновлены!</b>\n\n{res_list}\n\nТеперь все новые игроки гарантированно будут получать этот набор из 5 карт!",
         reply_markup=admin_main_keyboard(),
         parse_mode=ParseMode.HTML
     )
 
-# --- Admin: Batch Auto-Add Cards (Photos inherited from team) ---
+# --- Admin: Batch Auto-Add Cards ---
 @dp.callback_query(F.data == "adm_card_batch")
 async def cb_adm_batch(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
@@ -1799,7 +2494,7 @@ async def process_man_starter(callback: CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.HTML
     )
 
-# --- Admin: Teams Management (Name + Team Photo) ---
+# --- Admin: Teams Management ---
 @dp.callback_query(F.data == "adm_teams")
 async def cb_adm_teams(callback: CallbackQuery, state: FSMContext):
     async with db.pool.acquire() as conn:
