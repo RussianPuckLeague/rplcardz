@@ -55,7 +55,6 @@ STREAK_REWARDS = {
     7: {"type": "card", "min_ovr": 80, "max_ovr": 88, "desc": "Карточка 80-88 OVR"},
 }
 
-# 4 Skaters + 1 Goalie lineup slots
 ROSTER_SLOTS = ["skater_1", "skater_2", "skater_3", "skater_4", "goalie"]
 SLOT_NAMES = {
     "skater_1": "🏒 Полевой #1",
@@ -108,6 +107,7 @@ class Database:
                     team_name VARCHAR(100),
                     country VARCHAR(100),
                     player_name VARCHAR(100),
+                    username VARCHAR(100),
                     mmr INT DEFAULT 500,
                     rpl_coins BIGINT DEFAULT 1000,
                     exp INT DEFAULT 50,
@@ -117,6 +117,11 @@ class Database:
                     streak_days INT DEFAULT 0,
                     last_streak_claim TIMESTAMP,
                     notified_cd BOOLEAN DEFAULT TRUE,
+                    jail_until TIMESTAMP,
+                    job_coach_cd TIMESTAMP,
+                    job_illegal_cd TIMESTAMP,
+                    job_photo_cd TIMESTAMP,
+                    job_merch_cd TIMESTAMP,
                     registered_at TIMESTAMP DEFAULT NOW()
                 );
 
@@ -179,9 +184,15 @@ class Database:
             # 2. Automated Migrations (updates existing DB columns safely)
             await conn.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS player_name VARCHAR(100);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_days INT DEFAULT 0;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_streak_claim TIMESTAMP;
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS notified_cd BOOLEAN DEFAULT TRUE;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS jail_until TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS job_coach_cd TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS job_illegal_cd TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS job_photo_cd TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS job_merch_cd TIMESTAMP;
                 ALTER TABLE users ALTER COLUMN rpl_coins TYPE BIGINT;
                 ALTER TABLE cards ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE;
                 ALTER TABLE cards ALTER COLUMN photo_id DROP NOT NULL;
@@ -382,7 +393,8 @@ dp.message.middleware(GroupCheckMiddleware())
 def main_menu_keyboard(is_private: bool = True) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="⚔️ Начать поиск игры", callback_data="search_game")],
-        [InlineKeyboardButton(text="🔍 Найти карточку", callback_data="claim_daily_btn")],
+        [InlineKeyboardButton(text="🔍 Найти карточку", callback_data="claim_daily_btn"),
+         InlineKeyboardButton(text="💼 Работы", callback_data="jobs_menu")],
         [InlineKeyboardButton(text="🏒 Состав (4+1)", callback_data="view_roster")],
         [InlineKeyboardButton(text="🎁 Ежедневные призы (7 дней)", callback_data="streak_rewards")],
         [InlineKeyboardButton(text="📦 Магазин паков", callback_data="pack_shop"),
@@ -413,6 +425,31 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📦 Создать пак", callback_data="adm_packs"),
          InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+
+def jobs_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏒 Тренер бросков (КД 2ч)", callback_data="job_coach")],
+        [InlineKeyboardButton(text="🕵️ Нелегал (Дела с риском)", callback_data="job_illegal_menu")],
+        [InlineKeyboardButton(text="📸 Спортивный фотограф (КД 6ч)", callback_data="job_photo")],
+        [InlineKeyboardButton(text="🎟 Продавец атрибутики (КД 2ч)", callback_data="job_merch_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+
+def illegal_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏦 Ограбить банк (100k RPL)", callback_data="do_illegal:bank")],
+        [InlineKeyboardButton(text="👛 Украсть кошелёк (до 10k RPL)", callback_data="do_illegal:wallet")],
+        [InlineKeyboardButton(text="🛒 Украсть продукты (до 15k RPL)", callback_data="do_illegal:shop")],
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")]
+    ])
+
+def merch_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏷 Дешёвая цена (65% шанс | 2 000–3 000)", callback_data="do_merch:cheap")],
+        [InlineKeyboardButton(text="🏷 Средняя цена (30% шанс | 4 000–6 000)", callback_data="do_merch:medium")],
+        [InlineKeyboardButton(text="🏷 Дорогая цена (15% шанс | 8 000–12 000)", callback_data="do_merch:expensive")],
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")]
     ])
 
 # ==================== HELPER: GET USER STATS & ROSTER 4+1 ====================
@@ -483,13 +520,14 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
         user_id = message.from_user.id
         user_name = message.from_user.full_name or message.from_user.username or "Хоккеист"
+        username = message.from_user.username
 
         async with db.pool.acquire() as conn:
             user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
         if user and user["team_name"]:
             async with db.pool.acquire() as conn:
-                await conn.execute("UPDATE users SET player_name = $1 WHERE user_id = $2", user_name, user_id)
+                await conn.execute("UPDATE users SET player_name = $1, username = $2 WHERE user_id = $3", user_name, username, user_id)
                 user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
             is_private = (message.chat.type == ChatType.PRIVATE)
@@ -529,13 +567,14 @@ async def process_country_choice(callback: CallbackQuery, state: FSMContext):
     team_name = data["team_name"]
     user_id = callback.from_user.id
     player_name = callback.from_user.full_name or "Хоккеист"
+    username = callback.from_user.username
 
     async with db.pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO users (user_id, team_name, country, player_name, mmr, rpl_coins, exp)
-            VALUES ($1, $2, $3, $4, 500, 1000, 50)
-            ON CONFLICT (user_id) DO UPDATE SET team_name = $2, country = $3, player_name = $4
-        """, user_id, team_name, country, player_name)
+            INSERT INTO users (user_id, team_name, country, player_name, username, mmr, rpl_coins, exp)
+            VALUES ($1, $2, $3, $4, $5, 500, 1000, 50)
+            ON CONFLICT (user_id) DO UPDATE SET team_name = $2, country = $3, player_name = $4, username = $5
+        """, user_id, team_name, country, player_name, username)
 
         # Grant starter cards
         starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
@@ -873,12 +912,348 @@ async def cb_set_slot(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     async with db.pool.acquire() as conn:
-        # Free slot from previous holder
         await conn.execute("UPDATE user_cards SET slot = NULL, in_lineup = FALSE WHERE user_id = $1 AND slot = $2", user_id, slot)
-        # Assign chosen card
         await conn.execute("UPDATE user_cards SET slot = $1, in_lineup = TRUE WHERE user_id = $2 AND id = $3", slot, user_id, uc_id)
 
     await cb_view_roster(callback)
+
+# ==================== JOBS SYSTEM ====================
+async def check_jail(user_id: int) -> Tuple[bool, str]:
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT jail_until FROM users WHERE user_id = $1", user_id)
+        if user and user["jail_until"] and user["jail_until"] > now:
+            diff = user["jail_until"] - now
+            hours, rem = divmod(int(diff.total_seconds()), 3600)
+            mins, _ = divmod(rem, 60)
+            return True, f"🚨 <b>ВЫ НАХОДИТЕСЬ В ТЮРЬМЕ!</b>\n\nДо освобождения осталось: <b>{hours}ч {mins}м</b>.\nВам запрещено работать на любых работах!"
+    return False, ""
+
+@dp.callback_query(F.data == "jobs_menu")
+async def cb_jobs_menu(callback: CallbackQuery):
+    is_in_jail, jail_msg = await check_jail(callback.from_user.id)
+    if is_in_jail:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
+    text = (
+        "💼 <b>РАЗДЕЛ РАБОТ И ПОДРАБОТОК RPL</b>\n\n"
+        "Зарабатывайте RPLCoin для усиления команды и покупки паков!\n\n"
+        "🏒 <b>Тренер бросков</b> — шанс 40%, награда 2 500 RPL (КД 2ч)\n"
+        "🕵️ <b>Нелегал</b> — дела с высоким риском тюрьмы до 48ч\n"
+        "📸 <b>Спортивный фотограф</b> — стабильная работа со съемкой матчей (КД 6ч)\n"
+        "🎟 <b>Продавец атрибутики</b> — выбор цены товара и выручки (КД 2ч)\n\n"
+        "Выберите желаемую работу:"
+    )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=jobs_menu_keyboard())
+
+# --- 1. Coach Job ---
+@dp.callback_query(F.data == "job_coach")
+async def cb_job_coach(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    is_in_jail, jail_msg = await check_jail(user_id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_coach_cd FROM users WHERE user_id = $1", user_id)
+        if user and user["job_coach_cd"]:
+            diff = now - user["job_coach_cd"]
+            if diff < timedelta(hours=2):
+                rem = timedelta(hours=2) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Тренировка еще не окончена! Ждите {h}ч {m}м.", show_alert=True)
+                return
+
+        # 40% success rate
+        is_success = (random.random() < 0.40)
+        await conn.execute("UPDATE users SET job_coach_cd = $1 WHERE user_id = $2", now, user_id)
+
+        if is_success:
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + 2500 WHERE user_id = $1", user_id)
+            res_text = (
+                "🏒 <b>ТРЕНИРОВКА БРОСКОВ ЗАВЕРШЕНА УСПЕШНО!</b>\n\n"
+                "Ваши подопечные отлично усвоили кистевой бросок и щелчок от синей линии!\n"
+                "💰 Вы заработали: <b>+2 500 RPLCoin</b>\n"
+                "⏳ Кулдаун: 2 часа."
+            )
+        else:
+            res_text = (
+                "🏒 <b>ТРЕНИРОВКА ПРОВАЛЕНА!</b>\n\n"
+                "Игроки сломали клюшки и переругались на льду. Руководство школы отказалось оплачивать тренировку.\n"
+                "❌ Выплата: 0 RPLCoin\n"
+                "⏳ Кулдаун: 2 часа."
+            )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# --- 2. Illegal Jobs ---
+@dp.callback_query(F.data == "job_illegal_menu")
+async def cb_job_illegal_menu(callback: CallbackQuery):
+    is_in_jail, jail_msg = await check_jail(callback.from_user.id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_illegal_cd FROM users WHERE user_id = $1", callback.from_user.id)
+        if user and user["job_illegal_cd"]:
+            diff = now - user["job_illegal_cd"]
+            if diff < timedelta(hours=12):
+                rem = timedelta(hours=12) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Уличная суета улеглась. Новое дело доступно через {h}ч {m}м.", show_alert=True)
+                return
+
+    text = (
+        "🕵️ <b>НЕЛЕГАЛЬНЫЕ ДЕЛА</b>\n\n"
+        "⚠️ <i>Внимание: провал любого дела грозит тюрьмой на 48 часов! В тюрьме заблокированы абсолютно все работы.</i>\n\n"
+        "🏦 <b>Ограбить банк:</b>\n"
+        "• Успех (15%): 100 000 RPLCoin\n"
+        "• Неудача (15%): ничего\n"
+        "• Тюрьма (70%): арест на 48 часов\n\n"
+        "👛 <b>Украсть кошелёк:</b>\n"
+        "• Успех (40%): до 10 000 RPLCoin\n"
+        "• Неудача (40%): ничего\n"
+        "• Тюрьма (20%): арест на 48 часов\n\n"
+        "🛒 <b>Украсть продукты в магазине:</b>\n"
+        "• Успех (30%): до 15 000 RPLCoin\n"
+        "• Неудача (30%): ничего\n"
+        "• Тюрьма (40%): арест на 48 часов\n\n"
+        "<i>После успеха или неудачи без ареста — КД 12 часов.</i>\n"
+        "Выберите дело на свой страх и риск:"
+    )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=illegal_menu_keyboard())
+
+@dp.callback_query(F.data.startswith("do_illegal:"))
+async def cb_do_illegal(callback: CallbackQuery):
+    crime = callback.data.split("do_illegal:")[1]
+    user_id = callback.from_user.id
+
+    is_in_jail, jail_msg = await check_jail(user_id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_illegal_cd FROM users WHERE user_id = $1", user_id)
+        if user and user["job_illegal_cd"]:
+            diff = now - user["job_illegal_cd"]
+            if diff < timedelta(hours=12):
+                rem = timedelta(hours=12) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Следующее дело можно начать через {h}ч {m}м.", show_alert=True)
+                return
+
+        roll = random.random()
+        if crime == "bank":
+            if roll < 0.15:
+                outcome = "success"
+                gain = 100000
+            elif roll < 0.30:
+                outcome = "fail"
+                gain = 0
+            else:
+                outcome = "jail"
+                gain = 0
+        elif crime == "wallet":
+            if roll < 0.40:
+                outcome = "success"
+                gain = random.randint(2500, 10000)
+            elif roll < 0.80:
+                outcome = "fail"
+                gain = 0
+            else:
+                outcome = "jail"
+                gain = 0
+        else: # shop
+            if roll < 0.30:
+                outcome = "success"
+                gain = random.randint(4000, 15000)
+            elif roll < 0.70:
+                outcome = "fail"
+                gain = 0
+            else:
+                outcome = "jail"
+                gain = 0
+
+        if outcome == "success":
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1, job_illegal_cd = $2 WHERE user_id = $3", gain, now, user_id)
+            res_text = (
+                "💰 <b>ДЕЛО ВЫГОРЕЛО! ЧИСТЫЙ КУШ!</b>\n\n"
+                f"Вы успешно провернули дело и скрылись от патрулей!\n"
+                f"Награда: <b>+{gain} RPLCoin</b>\n"
+                "⏳ Кулдаун: 12 часов."
+            )
+        elif outcome == "fail":
+            await conn.execute("UPDATE users SET job_illegal_cd = $1 WHERE user_id = $2", now, user_id)
+            res_text = (
+                "💨 <b>ОСЕЧКА БЕЗ ПОСЛЕДСТВИЙ</b>\n\n"
+                "Куш сорвался в последний момент, но вам чудом удалось скрыться в подворотне без встречи с полицией.\n"
+                "❌ Выручка: 0 RPLCoin\n"
+                "⏳ Кулдаун: 12 часов."
+            )
+        else: # jail
+            jail_time = now + timedelta(hours=48)
+            await conn.execute("UPDATE users SET jail_until = $1, job_illegal_cd = $2 WHERE user_id = $3", jail_time, now, user_id)
+            res_text = (
+                "🚨 <b>ВАС ПОЙМАЛИ С ПОЛИЧНЫМ! АРЕСТ!</b>\n\n"
+                "Сработала сигнализация, спецназ окружил здание! Вас задержали и отправили в тюрьму.\n"
+                "🔒 <b>Срок заключения: 48 часов.</b>\n"
+                "⚠️ На время заключения вам заблокированы ВСЕ работы!"
+            )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# --- 3. Sports Photographer Job ---
+@dp.callback_query(F.data == "job_photo")
+async def cb_job_photo(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    is_in_jail, jail_msg = await check_jail(user_id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_photo_cd FROM users WHERE user_id = $1", user_id)
+        if user and user["job_photo_cd"]:
+            diff = now - user["job_photo_cd"]
+            if diff < timedelta(hours=6):
+                rem = timedelta(hours=6) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Обработка фотографий матча! Ждите {h}ч {m}м.", show_alert=True)
+                return
+
+        roll = random.random()
+        if roll < 0.60:
+            reward = 2500
+            desc = "Рядовой репортаж со скамейки запасных. Редакция приняла стандартные кадры."
+        elif roll < 0.90:
+            reward = 5000
+            desc = "Отличные динамичные снимки силовых приемов! Журнал выделил вам бонус."
+        else:
+            reward = 10000
+            desc = "🔥 <b>СЕНСАЦИОННЫЙ КАДР!</b> Вы поймали решающий гол в овертайме в девятку! Главная полоса спортивных газет!"
+
+        await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1, job_photo_cd = $2 WHERE user_id = $3", reward, now, user_id)
+
+    res_text = (
+        "📸 <b>ФОТОСЕССИЯ ХОККЕЙНОГО МАТЧА</b>\n\n"
+        f"{desc}\n\n"
+        f"💰 Заработано: <b>+{reward} RPLCoin</b>\n"
+        "⏳ Кулдаун: 6 часов."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+# --- 4. Merch Seller Job ---
+@dp.callback_query(F.data == "job_merch_menu")
+async def cb_job_merch_menu(callback: CallbackQuery):
+    is_in_jail, jail_msg = await check_jail(callback.from_user.id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_merch_cd FROM users WHERE user_id = $1", callback.from_user.id)
+        if user and user["job_merch_cd"]:
+            diff = now - user["job_merch_cd"]
+            if diff < timedelta(hours=2):
+                rem = timedelta(hours=2) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Торговая точка на перерыве! Ждите {h}ч {m}м.", show_alert=True)
+                return
+
+    text = (
+        "🎟 <b>ПРОДАВЕЦ ХОККЕЙНОЙ АТРИБУТИКИ</b>\n\n"
+        "Вы торгуете клубными шарфами, джерси и шайбами перед ареной!\n"
+        "Выберите ценовую категорию партии товара:\n\n"
+        "• <b>Дешёвая</b> — 65% шанс продажи, выручка 2 000–3 000 RPLCoin\n"
+        "• <b>Средняя</b> — 30% шанс продажи, выручка 4 000–6 000 RPLCoin\n"
+        "• <b>Дорогая</b> — 15% шанс продажи, выручка 8 000–12 000 RPLCoin\n\n"
+        "⏳ Кулдаун: 2 часа."
+    )
+    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=merch_menu_keyboard())
+
+@dp.callback_query(F.data.startswith("do_merch:"))
+async def cb_do_merch(callback: CallbackQuery):
+    price_cat = callback.data.split("do_merch:")[1]
+    user_id = callback.from_user.id
+
+    is_in_jail, jail_msg = await check_jail(user_id)
+    if is_in_jail:
+        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        return
+
+    now = datetime.utcnow()
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT job_merch_cd FROM users WHERE user_id = $1", user_id)
+        if user and user["job_merch_cd"]:
+            diff = now - user["job_merch_cd"]
+            if diff < timedelta(hours=2):
+                rem = timedelta(hours=2) - diff
+                h, m = divmod(int(rem.total_seconds()), 3600)
+                m, _ = divmod(m, 60)
+                await callback.answer(f"⏳ Торговая смена уже закрыта! Ждите {h}ч {m}м.", show_alert=True)
+                return
+
+        roll = random.random()
+        if price_cat == "cheap":
+            success = (roll < 0.65)
+            gain = random.randint(2000, 3000)
+        elif price_cat == "medium":
+            success = (roll < 0.30)
+            gain = random.randint(4000, 6000)
+        else:
+            success = (roll < 0.15)
+            gain = random.randint(8000, 12000)
+
+        await conn.execute("UPDATE users SET job_merch_cd = $1 WHERE user_id = $2", now, user_id)
+
+        if success:
+            await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", gain, user_id)
+            res_text = (
+                "🎉 <b>АНШЛАГ У ПАВИЛЬОНА! ПАРТИЯ РАСПРОДАНА!</b>\n\n"
+                f"Болельщики раскупили всю клубную атрибутику до чистой полки!\n"
+                f"💰 Выручка: <b>+{gain} RPLCoin</b>\n"
+                "⏳ Кулдаун: 2 часа."
+            )
+        else:
+            res_text = (
+                "💨 <b>ТОВАР НЕ КУПИЛИ</b>\n\n"
+                "Погода испортилась, а болельщики быстро разошлись по трибунам. Выручка за эту смену составила ноль.\n"
+                "❌ Выручка: 0 RPLCoin\n"
+                "⏳ Кулдаун: 2 часа."
+            )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
+    ])
+    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 # ==================== MATCHMAKING & GAME ====================
 @dp.callback_query(F.data == "search_game")
@@ -1010,21 +1385,36 @@ async def run_ai_game_session(player1: dict):
     }
     await run_game_session(player1, ai_team, is_pvp=False)
 
-# ==================== LEADERBOARD (MMR) ====================
+# ==================== LEADERBOARD (MMR WITH USERNAME, WINS/LOSSES) ====================
 @dp.callback_query(F.data == "leaderboard_mmr")
 async def cb_leaderboard(callback: CallbackQuery):
     async with db.pool.acquire() as conn:
         top_users = await conn.fetch("""
-            SELECT player_name, team_name, country, mmr, wins, losses 
+            SELECT player_name, username, team_name, country, mmr, wins, losses 
             FROM users 
             WHERE team_name IS NOT NULL 
             ORDER BY mmr DESC LIMIT 10
         """)
 
-    text = "🏆 <b>ТАБЛИЦА ЛИДЕРОВ RPL (ТОП-10 MMR):</b>\n\n"
+    text = "🏆 <b>ТАБЛИЦА ЛИДЕРОВ RPL (ТОП-10 MMR)</b>\n\n"
     for idx, u in enumerate(top_users, 1):
-        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
-        text += f"{medal} <b>{html.escape(u['team_name'])}</b> ({html.escape(u['country'])}) — <b>{u['mmr']} MMR</b> (П: {u['wins']} | Пр: {u['losses']})\n"
+        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"<b>{idx}.</b>"
+        p_name = html.escape(u["player_name"] or "Хоккеист")
+        u_name = f"(@{html.escape(u['username'])})" if u["username"] else "(без @username)"
+        t_name = html.escape(u["team_name"] or "Без команды")
+        c_name = html.escape(u["country"] or "СНГ")
+        wins = u["wins"] or 0
+        losses = u["losses"] or 0
+        mmr = u["mmr"] or 500
+
+        text += (
+            f"{medal} <b>{p_name}</b> {u_name}\n"
+            f"🏒 {t_name} ({c_name})\n"
+            f"🏆 <b>{mmr} MMR</b> | 🟢 Победы: {wins} | 🔴 Поражения: {losses}\n\n"
+        )
+
+    if not top_users:
+        text += "Пока нет сыгранных матчей."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
     await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -1198,9 +1588,7 @@ async def process_starters_ids(message: Message, state: FSMContext):
         return
 
     async with db.pool.acquire() as conn:
-        # Reset all cards starter flag
         await conn.execute("UPDATE cards SET is_starter = FALSE")
-        # Mark chosen cards as starters
         await conn.execute("UPDATE cards SET is_starter = TRUE WHERE id = ANY($1)", ids)
         updated = await conn.fetch("SELECT id, name, ovr, position FROM cards WHERE is_starter = TRUE")
 
