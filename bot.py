@@ -55,6 +55,16 @@ STREAK_REWARDS = {
     7: {"type": "card", "min_ovr": 80, "max_ovr": 88, "desc": "Карточка 80-88 OVR"},
 }
 
+# 4 Skaters + 1 Goalie lineup slots
+ROSTER_SLOTS = ["skater_1", "skater_2", "skater_3", "skater_4", "goalie"]
+SLOT_NAMES = {
+    "skater_1": "🏒 Полевой #1",
+    "skater_2": "🏒 Полевой #2",
+    "skater_3": "🏒 Полевой #3",
+    "skater_4": "🏒 Полевой #4",
+    "goalie": "🧤 Вратарь"
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -112,7 +122,8 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS teams (
                     id SERIAL PRIMARY KEY,
-                    name VARCHAR(100) UNIQUE NOT NULL
+                    name VARCHAR(100) UNIQUE NOT NULL,
+                    photo_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS collections (
@@ -129,7 +140,7 @@ class Database:
                     position VARCHAR(20) NOT NULL,
                     team_name VARCHAR(100) DEFAULT 'Без команды',
                     collection_name VARCHAR(100) DEFAULT 'Основная',
-                    photo_id TEXT NOT NULL,
+                    photo_id TEXT,
                     is_starter BOOLEAN DEFAULT FALSE
                 );
 
@@ -138,6 +149,7 @@ class Database:
                     user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
                     card_id INT REFERENCES cards(id) ON DELETE CASCADE,
                     in_lineup BOOLEAN DEFAULT FALSE,
+                    slot VARCHAR(20),
                     acquired_at TIMESTAMP DEFAULT NOW(),
                     CONSTRAINT unique_user_card UNIQUE (user_id, card_id)
                 );
@@ -164,7 +176,7 @@ class Database:
                 );
             """)
 
-            # 2. Critical Migrations (ALTER TABLE for existing databases on Railway)
+            # 2. Automated Migrations (updates existing DB columns safely)
             await conn.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS player_name VARCHAR(100);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS streak_days INT DEFAULT 0;
@@ -172,8 +184,11 @@ class Database:
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS notified_cd BOOLEAN DEFAULT TRUE;
                 ALTER TABLE users ALTER COLUMN rpl_coins TYPE BIGINT;
                 ALTER TABLE cards ADD COLUMN IF NOT EXISTS is_starter BOOLEAN DEFAULT FALSE;
+                ALTER TABLE cards ALTER COLUMN photo_id DROP NOT NULL;
+                ALTER TABLE teams ADD COLUMN IF NOT EXISTS photo_id TEXT;
+                ALTER TABLE user_cards ADD COLUMN IF NOT EXISTS slot VARCHAR(20);
             """)
-            logger.info("Database schemas and auto-migrations initialized successfully.")
+            logger.info("Database schemas and auto-migrations verified successfully.")
 
 db = Database(DATABASE_URL)
 
@@ -184,7 +199,6 @@ class RegState(StatesGroup):
 
 class AdminBatchCard(StatesGroup):
     waiting_for_text = State()
-    waiting_for_photo = State()
 
 class AdminCardManual(StatesGroup):
     name = State()
@@ -199,6 +213,7 @@ class AdminCardManual(StatesGroup):
 
 class AdminTeamState(StatesGroup):
     team_name = State()
+    team_photo = State()
 
 class AdminCollectionState(StatesGroup):
     collection_name = State()
@@ -213,6 +228,9 @@ class AdminPromoState(StatesGroup):
     reward_type = State()
     reward_value = State()
     max_uses = State()
+
+class AdminStartersState(StatesGroup):
+    card_ids = State()
 
 class UserPromoState(StatesGroup):
     code = State()
@@ -338,7 +356,6 @@ class GroupCheckMiddleware(BaseMiddleware):
         if not isinstance(event, Message) or not event.from_user:
             return await handler(event, data)
 
-        # Restrict ONLY group chats if user hasn't registered yet in PM
         if event.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
             if db.pool:
                 try:
@@ -365,7 +382,8 @@ dp.message.middleware(GroupCheckMiddleware())
 def main_menu_keyboard(is_private: bool = True) -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton(text="⚔️ Начать поиск игры", callback_data="search_game")],
-        [InlineKeyboardButton(text="🏒 Состав", callback_data="view_roster")],
+        [InlineKeyboardButton(text="🔍 Найти карточку", callback_data="claim_daily_btn")],
+        [InlineKeyboardButton(text="🏒 Состав (4+1)", callback_data="view_roster")],
         [InlineKeyboardButton(text="🎁 Ежедневные призы (7 дней)", callback_data="streak_rewards")],
         [InlineKeyboardButton(text="📦 Магазин паков", callback_data="pack_shop"),
          InlineKeyboardButton(text="🏆 Рейтинг MMR", callback_data="leaderboard_mmr")],
@@ -387,34 +405,57 @@ def cis_countries_keyboard() -> InlineKeyboardMarkup:
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Автодобавление карточек (Рядом)", callback_data="adm_card_batch")],
+        [InlineKeyboardButton(text="⭐ Назначить начальных игроков", callback_data="adm_starters")],
+        [InlineKeyboardButton(text="⚡ Автодобавление карточек", callback_data="adm_card_batch")],
         [InlineKeyboardButton(text="➕ Создать карточку (Вручную)", callback_data="adm_card_manual")],
-        [InlineKeyboardButton(text="🏒 Управление командами", callback_data="adm_teams"),
-         InlineKeyboardButton(text="📂 Управление коллекциями", callback_data="adm_collections")],
+        [InlineKeyboardButton(text="🏒 Команды (с фото)", callback_data="adm_teams"),
+         InlineKeyboardButton(text="📂 Коллекции", callback_data="adm_collections")],
         [InlineKeyboardButton(text="📦 Создать пак", callback_data="adm_packs"),
          InlineKeyboardButton(text="🎟 Создать промокод", callback_data="adm_promo")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
 
-# ==================== HELPER: GET USER STATS ====================
-async def get_user_roster_ovr(user_id: int) -> Tuple[int, List[dict], List[dict]]:
+# ==================== HELPER: GET USER STATS & ROSTER 4+1 ====================
+async def get_user_roster_ovr(user_id: int) -> Tuple[int, Dict[str, Optional[dict]], List[dict]]:
     async with db.pool.acquire() as conn:
-        all_cards = await conn.fetch("""
-            SELECT c.*, uc.id as user_card_id, uc.in_lineup 
+        all_cards_records = await conn.fetch("""
+            SELECT c.*, uc.id as user_card_id, uc.in_lineup, uc.slot,
+                   COALESCE(c.photo_id, t.photo_id) AS effective_photo
             FROM user_cards uc
             JOIN cards c ON uc.card_id = c.id
+            LEFT JOIN teams t ON c.team_name = t.name
             WHERE uc.user_id = $1
-            ORDER BY uc.in_lineup DESC, c.ovr DESC
+            ORDER BY c.ovr DESC
         """, user_id)
-        if not all_cards:
-            return 50, [], []
 
-        lineup_cards = [dict(c) for c in all_cards if c["in_lineup"]]
-        if not lineup_cards:
-            lineup_cards = [dict(c) for c in all_cards[:6]]
+    all_cards = [dict(r) for r in all_cards_records]
+    lineup_dict: Dict[str, Optional[dict]] = {slot: None for slot in ROSTER_SLOTS}
 
-        avg_ovr = int(sum(c["ovr"] for c in lineup_cards) / len(lineup_cards))
-        return avg_ovr, lineup_cards, [dict(c) for c in all_cards]
+    # Populate explicit slots
+    for c in all_cards:
+        if c.get("slot") in lineup_dict and lineup_dict[c["slot"]] is None:
+            lineup_dict[c["slot"]] = c
+
+    # Auto-fill empty slots if user just started and slots aren't explicitly assigned
+    used_ids = {c["id"] for c in lineup_dict.values() if c}
+    for slot in ["skater_1", "skater_2", "skater_3", "skater_4"]:
+        if lineup_dict[slot] is None:
+            for c in all_cards:
+                if c["position"] == "Skater" and c["id"] not in used_ids:
+                    lineup_dict[slot] = c
+                    used_ids.add(c["id"])
+                    break
+
+    if lineup_dict["goalie"] is None:
+        for c in all_cards:
+            if c["position"] == "Goalie" and c["id"] not in used_ids:
+                lineup_dict["goalie"] = c
+                used_ids.add(c["id"])
+                break
+
+    filled_cards = [c for c in lineup_dict.values() if c]
+    avg_ovr = int(sum(c["ovr"] for c in filled_cards) / len(filled_cards)) if filled_cards else 50
+    return avg_ovr, lineup_dict, all_cards
 
 def render_profile_text(user: dict, full_name: str) -> str:
     lvl, cur_xp, req_xp = calculate_level_and_progress(user["exp"] or 0)
@@ -496,13 +537,22 @@ async def process_country_choice(callback: CallbackQuery, state: FSMContext):
             ON CONFLICT (user_id) DO UPDATE SET team_name = $2, country = $3, player_name = $4
         """, user_id, team_name, country, player_name)
 
-        starters = await conn.fetch("SELECT id FROM cards WHERE is_starter = TRUE")
+        # Grant starter cards
+        starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
+        skater_count = 0
         for st in starters:
+            slot_name = None
+            if st["position"] == "Skater" and skater_count < 4:
+                skater_count += 1
+                slot_name = f"skater_{skater_count}"
+            elif st["position"] == "Goalie":
+                slot_name = "goalie"
+
             await conn.execute("""
-                INSERT INTO user_cards (user_id, card_id, in_lineup)
-                VALUES ($1, $2, TRUE)
+                INSERT INTO user_cards (user_id, card_id, in_lineup, slot)
+                VALUES ($1, $2, TRUE, $3)
                 ON CONFLICT (user_id, card_id) DO NOTHING
-            """, user_id, st["id"])
+            """, user_id, st["id"], slot_name)
 
         user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
@@ -550,11 +600,10 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
 
         # 5% chance to find "Ничего"
         if random.random() < 0.05:
-            # Set notified_cd to FALSE so notifier will ping user when 12h passes
             await conn.execute("UPDATE users SET last_daily_claim = $1, notified_cd = FALSE WHERE user_id = $2", now, user_id)
             return True, "💨 <b>Вам выпало:</b> Ничего!\nУвы, удача отвернулась в этот раз. Возвращайтесь через 12 часов!", None
 
-        # Rarity probabilities
+        # Rarity chances
         r = random.random()
         cumulative = 0.0
         chosen_rarity = "Редкая"
@@ -564,18 +613,22 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
                 chosen_rarity = rarity
                 break
 
-        # Strictly no duplicate cards
+        # Rule: NO DUPLICATE CARDS. Fetch effective photo from card OR its team!
         available_cards = await conn.fetch("""
-            SELECT * FROM cards 
-            WHERE rarity = $1 
-              AND id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $2)
+            SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
+            FROM cards c
+            LEFT JOIN teams t ON c.team_name = t.name
+            WHERE c.rarity = $1 
+              AND c.id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $2)
         """, chosen_rarity, user_id)
 
         if not available_cards:
             available_cards = await conn.fetch("""
-                SELECT * FROM cards 
-                WHERE rarity != 'Секретная' 
-                  AND id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $1)
+                SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
+                FROM cards c
+                LEFT JOIN teams t ON c.team_name = t.name
+                WHERE c.rarity != 'Секретная' 
+                  AND c.id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $1)
             """, user_id)
 
         if not available_cards:
@@ -583,7 +636,6 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
 
         card = random.choice(available_cards)
         await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, card["id"])
-        # Set notified_cd to FALSE so user will be notified 12 hours later
         await conn.execute("UPDATE users SET last_daily_claim = $1, notified_cd = FALSE WHERE user_id = $2", now, user_id)
 
     caption = (
@@ -594,7 +646,7 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
         f"Страна: <b>{html.escape(card['country'])}</b>\n\n"
         f"✅ Карточка сохранена в вашей коллекции!"
     )
-    return True, caption, card["photo_id"]
+    return True, caption, card["effective_photo"]
 
 @dp.message(Command("card"))
 async def cmd_card(message: Message):
@@ -625,7 +677,6 @@ async def card_cooldown_notifier():
                 continue
 
             async with db.pool.acquire() as conn:
-                # Find users whose last_daily_claim was >= 12 hours ago and haven't been notified yet
                 ready_users = await conn.fetch("""
                     SELECT user_id, player_name 
                     FROM users 
@@ -638,7 +689,7 @@ async def card_cooldown_notifier():
                     u_id = u["user_id"]
                     try:
                         kb = InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="🎁 Забрать карточку", callback_data="claim_daily_btn")]
+                            [InlineKeyboardButton(text="🔍 Найти карточку", callback_data="claim_daily_btn")]
                         ])
                         await bot.send_message(
                             chat_id=u_id,
@@ -646,7 +697,7 @@ async def card_cooldown_notifier():
                                 "⏰ <b>Кулдаун на карточку прошел!</b>\n\n"
                                 "Прошло 12 часов с момента последнего открытия. "
                                 "Ваша новая карточка уже ждет вас на льду!\n\n"
-                                "👉 Нажмите кнопку ниже или отправьте команду <b>/card</b>:"
+                                "👉 Нажмите кнопку <b>«Найти карточку»</b> ниже или введите команду <b>/card</b>:"
                             ),
                             reply_markup=kb,
                             parse_mode=ParseMode.HTML
@@ -654,7 +705,6 @@ async def card_cooldown_notifier():
                         await conn.execute("UPDATE users SET notified_cd = TRUE WHERE user_id = $1", u_id)
                         logger.info(f"Cooldown notification sent to user {u_id}")
                     except Exception as send_err:
-                        # If user blocked bot or deleted dialogue, mark as notified to avoid spamming errors
                         logger.warning(f"Failed to send cooldown notification to {u_id}: {send_err}")
                         await conn.execute("UPDATE users SET notified_cd = TRUE WHERE user_id = $1", u_id)
         except Exception as e:
@@ -707,16 +757,18 @@ async def cb_streak_rewards(callback: CallbackQuery):
         else:
             min_o, max_o = reward_info["min_ovr"], reward_info["max_ovr"]
             free_cards = await conn.fetch("""
-                SELECT * FROM cards 
-                WHERE ovr BETWEEN $1 AND $2 
-                  AND id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $3)
+                SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
+                FROM cards c
+                LEFT JOIN teams t ON c.team_name = t.name
+                WHERE c.ovr BETWEEN $1 AND $2 
+                  AND c.id NOT IN (SELECT card_id FROM user_cards WHERE user_id = $3)
             """, min_o, max_o, user_id)
 
             if free_cards:
                 c = random.choice(free_cards)
                 await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, c["id"])
                 bonus_str = f"Вам выпала карточка <b>{html.escape(c['name'])}</b> (OVR: {c['ovr']}, {c['rarity']})!"
-                card_photo = c["photo_id"]
+                card_photo = c["effective_photo"]
             else:
                 await conn.execute("UPDATE users SET rpl_coins = rpl_coins + 15000 WHERE user_id = $1", user_id)
                 bonus_str = "Все карточки этого диапазона уже у вас! Начислена компенсация <b>15 000 RPLCoin</b>."
@@ -744,56 +796,87 @@ async def cb_streak_rewards(callback: CallbackQuery):
     else:
         await callback.message.edit_text(schedule_text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-# ==================== ROSTER (VIEW IN GROUP, EDIT IN PM) ====================
+# ==================== ROSTER 4+1 (VIEW IN GROUP, EDIT BY POSITION IN PM) ====================
 @dp.callback_query(F.data == "view_roster")
 async def cb_view_roster(callback: CallbackQuery):
     user_id = callback.from_user.id
     is_pm = (callback.message.chat.type == ChatType.PRIVATE)
     avg_ovr, lineup, all_cards = await get_user_roster_ovr(user_id)
 
-    if not all_cards:
-        await callback.answer("У вас еще нет карточек!", show_alert=True)
-        return
-
     text = (
-        f"🏒 <b>СОСТАВ КОМАНДЫ</b>\n"
+        f"🏒 <b>СОСТАВ КОМАНДЫ (Формат 4+1)</b>\n"
         f"Средний OVR активного звена: <b>{avg_ovr}</b>\n\n"
-        f"⭐ <b>Основной состав (на льду):</b>\n"
+        f"<b>Текущее звено на льду:</b>\n"
     )
-    for i, c in enumerate(lineup, 1):
-        text += f"{i}. [{html.escape(c['position'])}] <b>{html.escape(c['name'])}</b> — OVR: <b>{c['ovr']}</b> ({html.escape(c['rarity'])})\n"
+    for slot in ROSTER_SLOTS:
+        c = lineup.get(slot)
+        if c:
+            text += f"• <b>{SLOT_NAMES[slot]}:</b> {html.escape(c['name'])} (OVR {c['ovr']}, {c['rarity']})\n"
+        else:
+            text += f"• <b>{SLOT_NAMES[slot]}:</b> <i>[Пусто]</i>\n"
 
     buttons = []
     if is_pm:
-        text += "\n🛠 <i>В личных сообщениях вы можете изменять состав (нажмите на карту ниже):</i>\n"
-        for c in all_cards[:10]:
-            status_ico = "🟢 В составе" if c["in_lineup"] else "⚪️ В запасе"
+        text += "\n🛠 <i>Нажмите на позицию ниже, чтобы выбрать или заменить игрока:</i>"
+        for slot in ROSTER_SLOTS:
+            c = lineup.get(slot)
+            cur_title = f"{c['name']} ({c['ovr']})" if c else "Выбрать игрока"
             buttons.append([InlineKeyboardButton(
-                text=f"{status_ico} | {c['name']} ({c['ovr']})",
-                callback_data=f"toggle_roster:{c['user_card_id']}"
+                text=f"{SLOT_NAMES[slot]}: {cur_title}",
+                callback_data=f"pick_slot:{slot}"
             )])
     else:
         bot_user = await bot.get_me()
-        buttons.append([InlineKeyboardButton(text="✏️ Настроить состав в ЛС", url=f"https://t.me/{bot_user.username}?start=roster")])
+        buttons.append([InlineKeyboardButton(text="✏️ Редактировать состав в ЛС", url=f"https://t.me/{bot_user.username}?start=roster")])
 
     buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")])
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
 
-@dp.callback_query(F.data.startswith("toggle_roster:"))
-async def cb_toggle_roster(callback: CallbackQuery):
-    uc_id = int(callback.data.split("toggle_roster:")[1])
+@dp.callback_query(F.data.startswith("pick_slot:"))
+async def cb_pick_slot(callback: CallbackQuery):
+    slot = callback.data.split("pick_slot:")[1]
+    user_id = callback.from_user.id
+    req_pos = "Goalie" if slot == "goalie" else "Skater"
+
+    async with db.pool.acquire() as conn:
+        cards = await conn.fetch("""
+            SELECT c.*, uc.id as user_card_id, uc.slot 
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = $1 AND c.position = $2
+            ORDER BY c.ovr DESC
+        """, user_id, req_pos)
+
+    buttons = []
+    for c in cards:
+        status_ico = f" (Занят: {SLOT_NAMES.get(c['slot'], '')})" if c['slot'] else ""
+        btn_text = f"{c['name']} (OVR {c['ovr']}){status_ico}"
+        buttons.append([InlineKeyboardButton(
+            text=btn_text,
+            callback_data=f"set_slot:{slot}:{c['user_card_id']}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Назад к составу", callback_data="view_roster")])
+    await callback.message.edit_text(
+        f"🏒 <b>Выбор игрока на позицию: {SLOT_NAMES[slot]}</b>\n"
+        f"Требуемая позиция: <b>{req_pos}</b>\n\n"
+        f"Выберите карточку из доступных:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data.startswith("set_slot:"))
+async def cb_set_slot(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    slot = parts[1]
+    uc_id = int(parts[2])
     user_id = callback.from_user.id
 
     async with db.pool.acquire() as conn:
-        item = await conn.fetchrow("SELECT in_lineup FROM user_cards WHERE id = $1 AND user_id = $2", uc_id, user_id)
-        if item:
-            new_val = not item["in_lineup"]
-            if new_val:
-                cnt = await conn.fetchval("SELECT count(*) FROM user_cards WHERE user_id = $1 AND in_lineup = TRUE", user_id)
-                if cnt >= 6:
-                    await callback.answer("❌ В основном составе может быть максимум 6 игроков!", show_alert=True)
-                    return
-            await conn.execute("UPDATE user_cards SET in_lineup = $1 WHERE id = $2", new_val, uc_id)
+        # Free slot from previous holder
+        await conn.execute("UPDATE user_cards SET slot = NULL, in_lineup = FALSE WHERE user_id = $1 AND slot = $2", user_id, slot)
+        # Assign chosen card
+        await conn.execute("UPDATE user_cards SET slot = $1, in_lineup = TRUE WHERE user_id = $2 AND id = $3", slot, user_id, uc_id)
 
     await cb_view_roster(callback)
 
@@ -914,7 +997,7 @@ async def run_ai_game_session(player1: dict):
         ai_cards_available = await conn.fetch("SELECT id, ovr FROM cards WHERE NOT (id = ANY($1))", user_card_ids)
 
     if ai_cards_available:
-        selected_ai = random.sample(ai_cards_available, min(6, len(ai_cards_available)))
+        selected_ai = random.sample(ai_cards_available, min(5, len(ai_cards_available)))
         ai_ovr = int(sum(c["ovr"] for c in selected_ai) / len(selected_ai))
     else:
         ai_ovr = max(50, min(99, user_ovr + random.randint(-2, 2)))
@@ -990,7 +1073,12 @@ async def cb_buy_pack(callback: CallbackQuery):
             return
 
         chosen_id = random.choice(available_ids)["id"]
-        card = await conn.fetchrow("SELECT * FROM cards WHERE id = $1", chosen_id)
+        card = await conn.fetchrow("""
+            SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
+            FROM cards c
+            LEFT JOIN teams t ON c.team_name = t.name
+            WHERE c.id = $1
+        """, chosen_id)
 
         await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", pack["price"], user_id)
         await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, chosen_id)
@@ -1005,8 +1093,11 @@ async def cb_buy_pack(callback: CallbackQuery):
         [InlineKeyboardButton(text="📦 Еще паки", callback_data="pack_shop")],
         [InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]
     ])
-    await callback.message.delete()
-    await callback.message.answer_photo(photo=card["photo_id"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    if card["effective_photo"]:
+        await callback.message.delete()
+        await callback.message.answer_photo(photo=card["effective_photo"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await callback.message.edit_text(caption, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 # ==================== PROMO CODES ====================
 @dp.callback_query(F.data == "enter_promo")
@@ -1066,23 +1157,78 @@ async def cmd_admin_rpl(message: Message, state: FSMContext):
         return
     await message.answer("⚙️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА RPL</b>\nВыберите действие:", reply_markup=admin_main_keyboard(), parse_mode=ParseMode.HTML)
 
-# ==================== BATCH / MULTI-LINE CARD ADDITION ====================
+@dp.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    await callback.message.edit_text("⚙️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА RPL</b>\nВыберите действие:", reply_markup=admin_main_keyboard(), parse_mode=ParseMode.HTML)
+
+# --- Admin: Setup Starter Players by IDs ---
+@dp.callback_query(F.data == "adm_starters")
+async def cb_adm_starters(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminStartersState.card_ids)
+
+    async with db.pool.acquire() as conn:
+        current_starters = await conn.fetch("SELECT id, name, ovr, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
+
+    st_text = "⭐ <b>НАЗНАЧИТЬ НАЧАЛЬНЫХ ИГРОКОВ НОВИЧКАМ</b>\n\n"
+    if current_starters:
+        st_text += "<b>Текущие стартовые карточки:</b>\n"
+        for s in current_starters:
+            st_text += f"• #{s['id']} {s['name']} (OVR {s['ovr']}, {s['position']})\n"
+    else:
+        st_text += "Стартовых игроков еще не назначено.\n"
+
+    st_text += "\nОтправьте <b>ID карточек через запятую</b>, которые будут стартовым набором для всех новичков:\n<i>Пример: 1, 2, 3, 4, 5</i>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]])
+    await callback.message.edit_text(st_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@dp.message(AdminStartersState.card_ids)
+async def process_starters_ids(message: Message, state: FSMContext):
+    try:
+        ids = [int(x.strip()) for x in message.text.split(",") if x.strip().isdigit()]
+        if not ids:
+            raise ValueError()
+    except Exception:
+        await message.answer("❌ Неверный формат! Отправьте список ID через запятую (например: 1, 4, 8, 12):")
+        return
+
+    async with db.pool.acquire() as conn:
+        # Reset all cards starter flag
+        await conn.execute("UPDATE cards SET is_starter = FALSE")
+        # Mark chosen cards as starters
+        await conn.execute("UPDATE cards SET is_starter = TRUE WHERE id = ANY($1)", ids)
+        updated = await conn.fetch("SELECT id, name, ovr, position FROM cards WHERE is_starter = TRUE")
+
+    await state.clear()
+    res_list = "\n".join([f"• #{c['id']} {c['name']} (OVR {c['ovr']}, {c['position']})" for c in updated])
+    await message.answer(
+        f"✅ <b>Стартовые карточки успешно обновлены!</b>\n\n{res_list}\n\nТеперь все новые игроки будут получать этот набор!",
+        reply_markup=admin_main_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
+
+# --- Admin: Batch Auto-Add Cards (Photos inherited from team) ---
 @dp.callback_query(F.data == "adm_card_batch")
 async def cb_adm_batch(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AdminBatchCard.waiting_for_text)
     instructions = (
-        "⚡ <b>АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ КАРТОЧЕК (РЯДОМ В СТОЛБИК)</b>\n\n"
-        "Отправьте список игроков. <b>Каждый игрок с новой строки</b> в формате:\n\n"
+        "⚡ <b>АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ КАРТОЧЕК</b>\n\n"
+        "Отправьте список игроков в столбик. <b>Каждый игрок с новой строки:</b>\n\n"
         "<code>Nick # | Редкость | Страна | OVR | Позиция | ID Команды | ID Коллекции</code>\n\n"
         "📌 <b>Пример:</b>\n"
         "<code>Аверин 10 | Редкая | 🇷🇺 Россия | 76 | Skater | 1 | 1\n"
         "Бобров 20 | Очень редкая | 🇧🇾 Беларусь | 81 | Goalie | 2 | 1\n"
-        "Овечкин 8 | Легендарная | 🇷🇺 Россия | 95 | Skater | 0 | 1</code>\n\n"
-        "<i>(Если ID Команды или Коллекции указать 0 — будет 'Без команды' и 'Основная')</i>"
+        "Овечкин 8 | Легендарная | 🇷🇺 Россия | 95 | Skater | 1 | 1</code>\n\n"
+        "<i>Фото карточки автоматически возьмется от команды (по ID Команды)!</i>"
     )
-    await callback.message.edit_text(instructions, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="back_main")]]))
+    await callback.message.edit_text(instructions, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminBatchCard.waiting_for_text)
 async def process_batch_text(message: Message, state: FSMContext):
@@ -1134,46 +1280,29 @@ async def process_batch_text(message: Message, state: FSMContext):
                 "ovr": int(ovr_str),
                 "position": pos_clean,
                 "team_name": team_name,
-                "collection_name": col_name,
-                "is_starter": False
+                "collection_name": col_name
             })
 
-    if not parsed_cards:
-        err_msg = "\n".join(errors[:10])
-        await message.answer(f"❌ Не удалось распознать ни одной карточки!\nОшибки:\n{err_msg}")
-        return
+        if not parsed_cards:
+            err_msg = "\n".join(errors[:10])
+            await message.answer(f"❌ Не удалось распознать игроков:\n{err_msg}")
+            return
 
-    await state.update_data(parsed_cards=parsed_cards)
-    await state.set_state(AdminBatchCard.waiting_for_photo)
-
-    err_suffix = f"\n⚠️ Пропущено строк с ошибками: {len(errors)}" if errors else ""
-    await message.answer(
-        f"✅ Распознано <b>{len(parsed_cards)}</b> игроков!{err_suffix}\n\n"
-        f"📸 Теперь отправьте <b>одно фото</b>, которое будет прикреплено к этой пачке карточек:",
-        parse_mode=ParseMode.HTML
-    )
-
-@dp.message(AdminBatchCard.waiting_for_photo, F.photo)
-async def process_batch_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    data = await state.get_data()
-    cards_list = data["parsed_cards"]
-
-    created_ids = []
-    async with db.pool.acquire() as conn:
-        for c in cards_list:
+        created_ids = []
+        for c in parsed_cards:
             row = await conn.fetchrow("""
                 INSERT INTO cards (name, rarity, country, ovr, position, team_name, collection_name, photo_id, is_starter)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, FALSE)
                 RETURNING id
-            """, c["name"], c["rarity"], c["country"], c["ovr"], c["position"], c["team_name"], c["collection_name"], photo_id, c["is_starter"])
+            """, c["name"], c["rarity"], c["country"], c["ovr"], c["position"], c["team_name"], c["collection_name"])
             created_ids.append(row["id"])
 
     await state.clear()
+    err_suffix = f"\n⚠️ Пропущено некорректных строк: {len(errors)}" if errors else ""
     await message.answer(
-        f"🎉 <b>Успешно сохранено {len(created_ids)} карточек!</b>\n\n"
-        f"Диапазон ID: #{created_ids[0]} — #{created_ids[-1]}\n"
-        f"Все карточки готовы к выпадению в игре!",
+        f"🎉 <b>Успешно добавлено {len(created_ids)} карточек!</b>{err_suffix}\n\n"
+        f"Диапазон присвоенных ID: #{created_ids[0]} — #{created_ids[-1]}\n"
+        f"Карточки автоматически наследуют фото своих команд!",
         reply_markup=admin_main_keyboard(),
         parse_mode=ParseMode.HTML
     )
@@ -1184,13 +1313,14 @@ async def cb_adm_manual(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AdminCardManual.name)
-    await callback.message.edit_text("📝 <b>РУЧНОЕ СОЗДАНИЕ КАРТОЧКИ</b>\nВведите имя игрока:")
+    await callback.message.edit_text("📝 <b>РУЧНОЕ СОЗДАНИЕ КАРТОЧКИ</b>\nВведите имя игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCardManual.name)
 async def process_man_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AdminCardManual.rarity)
     buttons = [[InlineKeyboardButton(text=r, callback_data=f"man_r:{r}")] for r in RARITIES]
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
     await message.answer("Выберите редкость карточки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.rarity, F.data.startswith("man_r:"))
@@ -1199,6 +1329,7 @@ async def process_man_rarity(callback: CallbackQuery, state: FSMContext):
     await state.update_data(rarity=rarity)
     await state.set_state(AdminCardManual.country)
     buttons = [[InlineKeyboardButton(text=c, callback_data=f"man_c:{c}")] for c in CIS_COUNTRIES]
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
     await callback.message.edit_text("Выберите страну игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.country, F.data.startswith("man_c:"))
@@ -1206,7 +1337,7 @@ async def process_man_country(callback: CallbackQuery, state: FSMContext):
     country = callback.data.split("man_c:")[1]
     await state.update_data(country=country)
     await state.set_state(AdminCardManual.ovr)
-    await callback.message.edit_text("Введите OVR карточки (50 - 99):")
+    await callback.message.edit_text("Введите OVR карточки (50 - 99):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCardManual.ovr)
 async def process_man_ovr(message: Message, state: FSMContext):
@@ -1217,7 +1348,8 @@ async def process_man_ovr(message: Message, state: FSMContext):
     await state.set_state(AdminCardManual.position)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Полевой (Skater)", callback_data="man_p:Skater")],
-        [InlineKeyboardButton(text="Вратарь (Goalie)", callback_data="man_p:Goalie")]
+        [InlineKeyboardButton(text="Вратарь (Goalie)", callback_data="man_p:Goalie")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]
     ])
     await message.answer("Выберите позицию:", reply_markup=kb)
 
@@ -1231,6 +1363,7 @@ async def process_man_position(callback: CallbackQuery, state: FSMContext):
     buttons = [[InlineKeyboardButton(text="Без команды", callback_data="man_t:Без команды")]]
     for t in teams:
         buttons.append([InlineKeyboardButton(text=t["name"], callback_data=f"man_t:{t['name']}")])
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
     await callback.message.edit_text("Выберите команду:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.team, F.data.startswith("man_t:"))
@@ -1243,6 +1376,7 @@ async def process_man_team(callback: CallbackQuery, state: FSMContext):
     buttons = [[InlineKeyboardButton(text="Основная", callback_data="man_col:Основная")]]
     for c in cols:
         buttons.append([InlineKeyboardButton(text=c["name"], callback_data=f"man_col:{c['name']}")])
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
     await callback.message.edit_text("Выберите коллекцию:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.collection, F.data.startswith("man_col:"))
@@ -1252,68 +1386,93 @@ async def process_man_collection(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminCardManual.is_starter)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Да, стартовая для новичков", callback_data="man_s:1")],
-        [InlineKeyboardButton(text="Нет, обычная", callback_data="man_s:0")]
+        [InlineKeyboardButton(text="Нет, обычная", callback_data="man_s:0")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]
     ])
     await callback.message.edit_text("Выдавать эту карту новичкам при старте?", reply_markup=kb)
 
 @dp.callback_query(AdminCardManual.is_starter, F.data.startswith("man_s:"))
 async def process_man_starter(callback: CallbackQuery, state: FSMContext):
     is_starter = (callback.data.split("man_s:")[1] == "1")
-    await state.update_data(is_starter=is_starter)
-    await state.set_state(AdminCardManual.photo)
-    await callback.message.edit_text("Отправьте фото для карточки:")
-
-@dp.message(AdminCardManual.photo, F.photo)
-async def process_man_photo(message: Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
     data = await state.get_data()
 
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO cards (name, rarity, country, ovr, position, team_name, collection_name, photo_id, is_starter)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8)
             RETURNING id
-        """, data["name"], data["rarity"], data["country"], data["ovr"], data["position"], data["team_name"], data["collection_name"], photo_id, data["is_starter"])
+        """, data["name"], data["rarity"], data["country"], data["ovr"], data["position"], data["team_name"], data["collection_name"], is_starter)
 
     await state.clear()
-    await message.answer(f"✅ Карточка <b>{html.escape(data['name'])}</b> создана! ID: <b>#{row['id']}</b>", reply_markup=admin_main_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.message.edit_text(
+        f"✅ Карточка <b>{html.escape(data['name'])}</b> создана! ID: <b>#{row['id']}</b>\n"
+        f"Фото будет автоматически отображаться из команды <b>{html.escape(data['team_name'])}</b>.",
+        reply_markup=admin_main_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
 
-# --- Admin: Teams & Collections ---
+# --- Admin: Teams Management (Name + Team Photo) ---
 @dp.callback_query(F.data == "adm_teams")
 async def cb_adm_teams(callback: CallbackQuery, state: FSMContext):
     async with db.pool.acquire() as conn:
         teams = await conn.fetch("SELECT * FROM teams ORDER BY id ASC")
-    t_text = "🏒 <b>СПИСОК КОМАНД (ID | Название):</b>\n\n"
+    t_text = "🏒 <b>УПРАВЛЕНИЕ КОМАНДАМИ:</b>\n\n"
     for t in teams:
-        t_text += f"• <b>ID: {t['id']}</b> — {html.escape(t['name'])}\n"
+        has_ph = "🖼 Есть фото" if t["photo_id"] else "❌ Без фото"
+        t_text += f"• <b>ID {t['id']}</b>: {html.escape(t['name'])} ({has_ph})\n"
     if not teams:
         t_text += "Команд пока нет.\n"
-    t_text += "\nОтправьте название новой команды для добавления:"
+    t_text += "\nОтправьте <b>название новой команды</b>:"
 
     await state.set_state(AdminTeamState.team_name)
-    await callback.message.edit_text(t_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="back_main")]]))
+    await callback.message.edit_text(t_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminTeamState.team_name)
-async def process_adm_team(message: Message, state: FSMContext):
+async def process_adm_team_name(message: Message, state: FSMContext):
     name = message.text.strip()
-    async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("INSERT INTO teams (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = $1 RETURNING id", name)
-    await state.clear()
-    await message.answer(f"✅ Команда <b>{html.escape(name)}</b> сохранена с <b>ID: {row['id']}</b>!", reply_markup=admin_main_keyboard(), parse_mode=ParseMode.HTML)
+    await state.update_data(team_name=name)
+    await state.set_state(AdminTeamState.team_photo)
+    await message.answer(
+        f"📸 Теперь отправьте <b>фотографию/логотип</b> для команды <b>{html.escape(name)}</b>:\n"
+        f"<i>(Это фото будет автоматически показываться для всех карточек этой команды!)</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]])
+    )
 
+@dp.message(AdminTeamState.team_photo, F.photo)
+async def process_adm_team_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    team_name = data["team_name"]
+
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO teams (name, photo_id) VALUES ($1, $2)
+            ON CONFLICT (name) DO UPDATE SET photo_id = $2
+            RETURNING id
+        """, team_name, photo_id)
+
+    await state.clear()
+    await message.answer(
+        f"✅ Команда <b>{html.escape(team_name)}</b> сохранена с ID <b>#{row['id']}</b> и привязанным фото!",
+        reply_markup=admin_main_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
+
+# --- Admin: Collections ---
 @dp.callback_query(F.data == "adm_collections")
 async def cb_adm_collections(callback: CallbackQuery, state: FSMContext):
     async with db.pool.acquire() as conn:
         cols = await conn.fetch("SELECT * FROM collections ORDER BY id ASC")
-    c_text = "📂 <b>СПИСОК КОЛЛЕКЦИЙ (ID | Название):</b>\n\n"
+    c_text = "📂 <b>СПИСОК КОЛЛЕКЦИЙ:</b>\n\n"
     for c in cols:
-        c_text += f"• <b>ID: {c['id']}</b> — {html.escape(c['name'])}\n"
+        c_text += f"• <b>ID {c['id']}</b>: {html.escape(c['name'])}\n"
     if not cols:
         c_text += "Коллекций пока нет.\n"
     c_text += "\nОтправьте название новой коллекции для добавления:"
 
     await state.set_state(AdminCollectionState.collection_name)
-    await callback.message.edit_text(c_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="back_main")]]))
+    await callback.message.edit_text(c_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCollectionState.collection_name)
 async def process_adm_col(message: Message, state: FSMContext):
@@ -1327,13 +1486,13 @@ async def process_adm_col(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_packs")
 async def cb_adm_packs(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminPackState.name)
-    await callback.message.edit_text("Введите название пака:")
+    await callback.message.edit_text("Введите название пака:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPackState.name)
 async def process_pack_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AdminPackState.price)
-    await message.answer("Введите цену пака в RPLCoin:")
+    await message.answer("Введите цену пака в RPLCoin:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPackState.price)
 async def process_pack_price(message: Message, state: FSMContext):
@@ -1342,7 +1501,7 @@ async def process_pack_price(message: Message, state: FSMContext):
         return
     await state.update_data(price=int(message.text))
     await state.set_state(AdminPackState.card_ids)
-    await message.answer("Введите ID карточек через запятую (например: 1, 5, 8, 12):")
+    await message.answer("Введите ID карточек через запятую (например: 1, 5, 8, 12):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPackState.card_ids)
 async def process_pack_cards(message: Message, state: FSMContext):
@@ -1365,7 +1524,7 @@ async def process_pack_cards(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_promo")
 async def cb_adm_promo(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminPromoState.code)
-    await callback.message.edit_text("Введите код нового промокода (например: RPLOVE):")
+    await callback.message.edit_text("Введите код нового промокода (например: RPLOVE):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPromoState.code)
 async def process_promo_code(message: Message, state: FSMContext):
@@ -1373,7 +1532,8 @@ async def process_promo_code(message: Message, state: FSMContext):
     await state.set_state(AdminPromoState.reward_type)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 RPLCoins", callback_data="pr_t:money")],
-        [InlineKeyboardButton(text="🃏 Карточка (ID)", callback_data="pr_t:card")]
+        [InlineKeyboardButton(text="🃏 Карточка (ID)", callback_data="pr_t:card")],
+        [InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]
     ])
     await message.answer("Выберите тип награды:", reply_markup=kb)
 
@@ -1383,7 +1543,7 @@ async def process_promo_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(reward_type=rw)
     await state.set_state(AdminPromoState.reward_value)
     prompt = "Введите количество монет:" if rw == "money" else "Введите ID карточки для выдачи:"
-    await callback.message.edit_text(prompt)
+    await callback.message.edit_text(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPromoState.reward_value)
 async def process_promo_val(message: Message, state: FSMContext):
@@ -1392,7 +1552,7 @@ async def process_promo_val(message: Message, state: FSMContext):
         return
     await state.update_data(reward_value=int(message.text))
     await state.set_state(AdminPromoState.max_uses)
-    await message.answer("Введите максимальное количество использований:")
+    await message.answer("Введите максимальное количество использований:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPromoState.max_uses)
 async def process_promo_uses(message: Message, state: FSMContext):
@@ -1420,7 +1580,6 @@ async def main():
     await db.connect()
     logger.info("Database connected successfully!")
 
-    # Start the background task for 12-hour cooldown notifications
     asyncio.create_task(card_cooldown_notifier())
 
     logger.info("Starting Telegram Bot Polling...")
