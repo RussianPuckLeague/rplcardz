@@ -31,7 +31,7 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 
 CIS_COUNTRIES = [
     "🇷🇺 Россия", "🇧🇾 Беларусь", "🇰🇿 Казахстан", "🇦🇲 Армения",
-    "🇦🇿 Азербайджан", "🇰🇬 Кыргызстан", "🇺🇿 Узбекистан",
+    "🇦🇿 Азербайджан", "🇰🇬 Кыргызстан", "уз Узбекистан",
     "🇹🇯 Таджикистан", "🇹🇲 Туркменистан", "🇲🇩 Молдова"
 ]
 
@@ -154,8 +154,7 @@ class Database:
                     card_id INT REFERENCES cards(id) ON DELETE CASCADE,
                     in_lineup BOOLEAN DEFAULT FALSE,
                     slot VARCHAR(20),
-                    acquired_at TIMESTAMP DEFAULT NOW(),
-                    CONSTRAINT unique_user_card UNIQUE (user_id, card_id)
+                    acquired_at TIMESTAMP DEFAULT NOW()
                 );
 
                 CREATE TABLE IF NOT EXISTS packs (
@@ -205,6 +204,7 @@ class Database:
                 ALTER TABLE cards ALTER COLUMN photo_id DROP NOT NULL;
                 ALTER TABLE teams ADD COLUMN IF NOT EXISTS photo_id TEXT;
                 ALTER TABLE user_cards ADD COLUMN IF NOT EXISTS slot VARCHAR(20);
+                CREATE UNIQUE INDEX IF NOT EXISTS user_cards_user_card_uniq ON user_cards (user_id, card_id);
             """)
             logger.info("Database schemas and auto-migrations verified successfully.")
 
@@ -268,57 +268,67 @@ class SlotsState(StatesGroup):
 
 # ==================== HELPER: GRANT STARTER CARDS ====================
 async def grant_starter_cards_for_user(conn, user_id: int):
-    starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
-    starters_list = [dict(s) for s in starters]
+    try:
+        starters = await conn.fetch("SELECT id, position FROM cards WHERE is_starter = TRUE ORDER BY id ASC")
+        starters_list = [dict(s) for s in starters]
 
-    # If fewer than 5 starters are designated, backfill with available cards from DB
-    if len(starters_list) < 5:
-        existing_ids = [s["id"] for s in starters_list]
-        has_goalie = any(s.get("position", "").lower() in ["goalie", "вратарь"] for s in starters_list)
-        if not has_goalie:
-            extra_g = await conn.fetch("""
-                SELECT id, position FROM cards 
-                WHERE (position ILIKE '%goalie%' OR position ILIKE '%врат%')
-                  AND id != ALL($1)
-                ORDER BY ovr ASC LIMIT 1
-            """, existing_ids if existing_ids else [0])
-            if extra_g:
-                starters_list.append(dict(extra_g[0]))
-                existing_ids.append(extra_g[0]["id"])
+        if len(starters_list) < 5:
+            existing_ids = [s["id"] for s in starters_list] or [0]
+            has_goalie = any("goalie" in s.get("position", "").lower() or "врат" in s.get("position", "").lower() for s in starters_list)
+            
+            if not has_goalie:
+                extra_g = await conn.fetch("""
+                    SELECT id, position FROM cards 
+                    WHERE (position ILIKE '%goalie%' OR position ILIKE '%врат%')
+                      AND NOT (id = ANY($1::int[]))
+                    ORDER BY ovr ASC LIMIT 1
+                """, existing_ids)
+                if extra_g:
+                    starters_list.append(dict(extra_g[0]))
+                    existing_ids.append(extra_g[0]["id"])
 
-        needed = 5 - len(starters_list)
-        if needed > 0:
-            extra = await conn.fetch("""
-                SELECT id, position FROM cards 
-                WHERE id != ALL($1)
-                ORDER BY ovr ASC LIMIT $2
-            """, existing_ids if existing_ids else [0], needed)
-            for e in extra:
-                starters_list.append(dict(e))
+            needed = 5 - len(starters_list)
+            if needed > 0:
+                extra = await conn.fetch("""
+                    SELECT id, position FROM cards 
+                    WHERE NOT (id = ANY($1::int[]))
+                    ORDER BY ovr ASC LIMIT $2
+                """, existing_ids, needed)
+                for e in extra:
+                    starters_list.append(dict(e))
 
-    skater_slots = ["skater_1", "skater_2", "skater_3", "skater_4"]
-    skater_idx = 0
-    goalie_assigned = False
+        if not starters_list:
+            return
 
-    for st in starters_list[:5]:
-        pos = st.get("position", "")
-        if ("goalie" in pos.lower() or "врат" in pos.lower()) and not goalie_assigned:
-            slot_name = "goalie"
-            goalie_assigned = True
-        elif skater_idx < len(skater_slots):
-            slot_name = skater_slots[skater_idx]
-            skater_idx += 1
-        elif not goalie_assigned:
-            slot_name = "goalie"
-            goalie_assigned = True
-        else:
-            slot_name = None
+        skater_slots = ["skater_1", "skater_2", "skater_3", "skater_4"]
+        skater_idx = 0
+        goalie_assigned = False
 
-        await conn.execute("""
-            INSERT INTO user_cards (user_id, card_id, in_lineup, slot)
-            VALUES ($1, $2, TRUE, $3)
-            ON CONFLICT (user_id, card_id) DO UPDATE SET in_lineup = TRUE, slot = COALESCE(user_cards.slot, EXCLUDED.slot)
-        """, user_id, st["id"], slot_name)
+        for st in starters_list[:5]:
+            pos = st.get("position", "")
+            if ("goalie" in pos.lower() or "врат" in pos.lower()) and not goalie_assigned:
+                slot_name = "goalie"
+                goalie_assigned = True
+            elif skater_idx < len(skater_slots):
+                slot_name = skater_slots[skater_idx]
+                skater_idx += 1
+            elif not goalie_assigned:
+                slot_name = "goalie"
+                goalie_assigned = True
+            else:
+                slot_name = None
+
+            has_card = await conn.fetchrow("SELECT id, slot FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, st["id"])
+            if not has_card:
+                await conn.execute("""
+                    INSERT INTO user_cards (user_id, card_id, in_lineup, slot)
+                    VALUES ($1, $2, TRUE, $3)
+                """, user_id, st["id"], slot_name)
+            else:
+                if not has_card["slot"] and slot_name:
+                    await conn.execute("UPDATE user_cards SET in_lineup = TRUE, slot = $1 WHERE id = $2", slot_name, has_card["id"])
+    except Exception as e:
+        logger.error(f"Error in grant_starter_cards_for_user: {e}", exc_info=True)
 
 # ==================== MATCH ENGINE & QUEUE ====================
 class MatchQueue:
@@ -610,7 +620,6 @@ async def cmd_start(message: Message, state: FSMContext):
         if user and user["team_name"]:
             async with db.pool.acquire() as conn:
                 await conn.execute("UPDATE users SET player_name = $1, username = $2 WHERE user_id = $3", user_name, username, user_id)
-                # Auto-check if user was shortchanged of starter cards (< 5 cards in total)
                 c_cnt = await conn.fetchval("SELECT COUNT(*) FROM user_cards WHERE user_id = $1", user_id)
                 if c_cnt < 5:
                     await grant_starter_cards_for_user(conn, user_id)
@@ -662,7 +671,6 @@ async def process_country_choice(callback: CallbackQuery, state: FSMContext):
             ON CONFLICT (user_id) DO UPDATE SET team_name = $2, country = $3, player_name = $4, username = $5
         """, user_id, team_name, country, player_name, username)
 
-        # Grant full set of 5 starter cards
         await grant_starter_cards_for_user(conn, user_id)
         user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
 
@@ -1130,19 +1138,16 @@ async def cb_market_buy(callback: CallbackQuery):
                 await callback.answer(f"❌ Недостаточно средств! Нужно: {price} RPL, у вас: {buyer['rpl_coins']} RPL.", show_alert=True)
                 return
 
-            # Check if buyer already owns this card
             has_card = await conn.fetchrow("SELECT 1 FROM user_cards WHERE user_id = $1 AND card_id = $2", buyer_id, listing["card_id"])
             if has_card:
                 await callback.answer("❌ У вас уже есть эта карточка в коллекции!", show_alert=True)
                 return
 
-            # Execute transaction
             await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", price, buyer_id)
             await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", price, listing["seller_id"])
             await conn.execute("DELETE FROM market_listings WHERE id = $1", listing_id)
             await conn.execute("INSERT INTO user_cards (user_id, card_id, in_lineup) VALUES ($1, $2, FALSE)", buyer_id, listing["card_id"])
 
-    # Notify seller
     try:
         await bot.send_message(
             chat_id=listing["seller_id"],
@@ -1212,14 +1217,12 @@ async def process_market_price(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     async with db.pool.acquire() as conn:
-        # Check ownership
         uc = await conn.fetchrow("SELECT id FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, card_id)
         if not uc:
             await message.answer("❌ Карточка не найдена у вас в инвентаре!")
             await state.clear()
             return
 
-        # Remove from user's lineup & cards to hold in market
         await conn.execute("DELETE FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, card_id)
         await conn.execute("INSERT INTO market_listings (seller_id, card_id, price) VALUES ($1, $2, $3)", user_id, card_id, price)
         card = await conn.fetchrow("SELECT name, ovr FROM cards WHERE id = $1", card_id)
@@ -1563,25 +1566,24 @@ async def run_slots_spin(message: Message, bet: int):
             await message.answer(f"❌ Недостаточно средств! Ваш баланс: {user['rpl_coins'] if user else 0} RPL.")
             return
 
-        # Deduct bet immediately
         await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", bet, user_id)
 
         roll = random.random()
-        if roll < 0.03: # 3% Rare triple x10
+        if roll < 0.03:
             sym = random.choice(rare_symbols)
             reels = [sym, sym, sym]
             multiplier = 10
-        elif roll < 0.10: # 7% Any triple x5 (0.03 + 0.07 = 0.10)
+        elif roll < 0.10:
             sym = random.choice(common_symbols)
             reels = [sym, sym, sym]
             multiplier = 5
-        elif roll < 0.25: # 15% Two matching x2 (0.10 + 0.15 = 0.25)
+        elif roll < 0.25:
             sym = random.choice(all_symbols)
             other = random.choice([x for x in all_symbols if x != sym])
             reels = [sym, sym, other]
             random.shuffle(reels)
             multiplier = 2
-        else: # 75% Loss
+        else:
             reels = random.sample(all_symbols, 3)
             multiplier = 0
 
@@ -2224,10 +2226,9 @@ async def process_user_promo(message: Message, state: FSMContext):
             res_text = f"🎉 Промокод активирован! Вы получили <b>{promo['reward_value']} RPLCoin</b>!"
         else:
             card = await conn.fetchrow("SELECT name, ovr FROM cards WHERE id = $1", promo["reward_value"])
-            await conn.execute("""
-                INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)
-                ON CONFLICT (user_id, card_id) DO NOTHING
-            """, user_id, promo["reward_value"])
+            has_c = await conn.fetchrow("SELECT 1 FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, promo["reward_value"])
+            if not has_c:
+                await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, promo["reward_value"])
             card_title = f"{html.escape(card['name'])} (OVR {card['ovr']})" if card else f"Карточка #{promo['reward_value']}"
             res_text = f"🎉 Промокод активирован! Вы получили: <b>{card_title}</b>!"
 
