@@ -329,74 +329,75 @@ async def grant_starter_cards_for_user(conn, user_id: int):
     except Exception as e:
         logger.error(f"Error in grant_starter_cards_for_user: {e}", exc_info=True)
 
-# ==================== 50+ DYNAMIC MATCH EVENTS (NAMED PLAYERS) ====================
+# ==================== 50+ DYNAMIC MATCH EVENTS ====================
 MATCH_EVENTS_CATALOG = [
     # Броски, штанги, перекладины
-    "🎯 Звонкая ШТАНГА! {att_p} сотрясает стойку ворот мощнейшим кистевым броском!",
-    "💥 ПЕРЕКЛАДИНА! {att_p} зарядил щелчком от синей линии — каркас ворот {def_team} звенит на всю арену!",
-    "🏒 {att_p} выкатывается из-за ворот и бросает с неудобной руки — штанга спасает {def_team}!",
-    "🎯 Коварнейший подпил шайбы от {att_p}! Снаряд чиркает по перекладине ворот {def_team}!",
-    "🏒 Выход 2 в 1! {att_p} берет инициативу на себя и стреляет в ближний угол — стойка ворот!",
-    "⚡ {att_p} щелкает в касание из левого круга вбрасывания — заградительное стекло ходит ходуном!",
-    "💥 Пушечный залп от синей линии от {att_p}! Шайба со свистом просвистела рядом со штангой!",
-    "🏒 {att_p} замыкает прострел на дальнем пятачке — звон штанги оглушает болельщиков {def_team}!",
-    "🎯 Хитрый бросок {att_p} из-под опеки защитника {def_p} — шайба угодила в каркас ворот!",
+    "🎯 Звонкая ШТАНГА! <b>{att_p}</b> ({att_team}) сотрясает каркас ворот {def_team} кистевым выстрелом!",
+    "💥 ПЕРЕКЛАДИНА! <b>{att_p}</b> ({att_team}) зарядил щелчком от синей линии — ворота {def_team} звенят на всю арену!",
+    "🏒 <b>{att_p}</b> ({att_team}) выкатывается из-за ворот и бросает с неудобной руки — штанга спасает {def_team}!",
+    "🎯 Коварный подпил шайбы от <b>{att_p}</b> ({att_team})! Шайба чиркает по перекладине ворот {def_team}!",
+    "🏒 Выход 2 в 1 в пользу {att_team}! <b>{att_p}</b> берет инициативу на себя и стреляет в ближний угол — стойка ворот!",
+    "⚡ <b>{att_p}</b> ({att_team}) щелкает в касание из правого круга вбрасывания — заградительное стекло дрожит!",
+    "💥 Пушечный залп от синей линии в исполнении <b>{att_p}</b> ({att_team})! Шайба просвистела рядом со штангой!",
+    "🏒 <b>{att_p}</b> ({att_team}) замыкает прострел на дальнем пятаке — звон штанги ворот {def_team}!",
+    "🎯 Хитрый бросок <b>{att_p}</b> ({att_team}) из-под защитника {def_p} — каркас спасает {def_team}!",
 
     # Сейвы вратарей
-    "🧤 ЧУДЕСНЫЙ СЕЙВ! Вратарь {def_g} в феноменальном шпагате вытягивает щиток и забирает мертвую шайбу после броска {att_p}!",
-    "🧤 Голкипер {def_g} намертво фиксирует шайбу ловушкой, сорвав чистый выход один в ноль от {att_p}!",
-    "🛡 Вратарь {def_g} отбивает перед собой бросок {att_p}, но тут же ложится на лед и накрывает добивание!",
-    "🧤 Невероятный рефлекс! {def_g} блином парирует ракетный выстрел {att_p} под перекладину!",
-    "🧤 Голкипер {def_g} кончиком клюшки выбивает шайбу прямо с крюка форварда {att_p}!",
-    "🛡 Роботоподобная реакция! Вратарь {def_g} шлемом отражает мощнейший щелчок от {att_p}!",
-    "🧤 {def_g} хладнокровно забирает шайбу в ловушку под оглушительный свист гостевой трибуны!",
-    "🧤 {def_g} закрывает 'домик' щитками и не пускает шайбу после резкого виража {att_p}!",
-    "🛡 Голкипер {def_g} в отчаянном прыжке парирует щелчок {att_p} в упор!",
+    "🧤 ЧУДЕСНЫЙ СЕЙВ! Вратарь <b>{def_g}</b> ({def_team}) в феноменальном шпагате достает мертвую шайбу после броска <b>{att_p}</b> ({att_team})!",
+    "🧤 Голкипер <b>{def_g}</b> ({def_team}) намертво фиксирует шайбу ловушкой, ликвидировав выход один в один от <b>{att_p}</b> ({att_team})!",
+    "🛡 Вратарь <b>{def_g}</b> ({def_team}) щитком парирует коварное добивание форварда <b>{att_p}</b> ({att_team})!",
+    "🧤 Невероятный рефлекс! <b>{def_g}</b> ({def_team}) блином переводит через стекло мощнейший выстрел <b>{att_p}</b> ({att_team})!",
+    "🧤 Голкипер <b>{def_g}</b> ({def_team}) кончиком клюшки сбивает шайбу прямо с крюка нападающего <b>{att_p}</b> ({att_team})!",
+    "🛡 Роботоподобная реакция! Вратарь <b>{def_g}</b> ({def_team}) шлемом отражает ракетный залп <b>{att_p}</b> ({att_team})!",
+    "🧤 <b>{def_g}</b> ({def_team}) надежно забирает шайбу в ловушку после броска <b>{att_p}</b> ({att_team})!",
+    "🧤 <b>{def_g}</b> ({def_team}) закрывает 'домик' щитками и не пускает шайбу после резкого виража <b>{att_p}</b> ({att_team})!",
+    "🛡 Голкипер <b>{def_g}</b> ({def_team}) в отчаянном прыжке парирует щелчок форварда <b>{att_p}</b> ({att_team})!",
 
     # Блокировки и действия защиты
-    "🛡 Защитник {def_p} бросается под пушечный щелчок {att_p} и телом блокирует шайбу!",
-    "🛡 {def_p} ювелирно подбивает клюшку форварду {att_p} в момент решающего броска по пустым воротам!",
-    "🛡 {def_p} намертво вяжет {att_p} на пятачке и не дает замкнуть острейшую передачу!",
-    "🛡 Самоотверженный блок-шот! {def_p} падает на лед и отбивает бросок {att_p} клюшкой!",
-    "🛡 Защитник {def_p} чисто выбивает шайбу с крюка {att_p} при выходе на рандеву с голкипером!",
+    "🛡 Защитник <b>{def_p}</b> ({def_team}) бросается под пушечный щелчок <b>{att_p}</b> ({att_team}) и спасает ворота!",
+    "🛡 <b>{def_p}</b> ({def_team}) ювелирно подбивает клюшку игроку <b>{att_p}</b> ({att_team}) в момент броска по открытому углу!",
+    "🛡 <b>{def_p}</b> ({def_team}) намертво вяжет форварда <b>{att_p}</b> на пятаке и прерывает острейшую атаку {att_team}!",
+    "🛡 Самоотверженный блок-шот! <b>{def_p}</b> ({def_team}) телом блокирует щелчок <b>{att_p}</b> ({att_team})!",
+    "🛡 Защитник <b>{def_p}</b> ({def_team}) чисто выбивает шайбу при выходе <b>{att_p}</b> ({att_team}) на рандеву с вратарем!",
 
     # Силовые приемы и борьба
-    "💥 СОКРУШИТЕЛЬНЫЙ ХИТ! {def_p} впечатывает форварда {att_p} в борт — защитные стекла дрожат!",
-    "💥 Зубодробительный силовой прием на синей линии! {def_p} жестко встречает {att_p} в корпус!",
-    "💥 {def_p} эффектной мельницей роняет на лед прорывавшегося на скорости {att_p}!",
-    "⚡ Жаркая потасовка на пятаке! {def_p} и {att_p} сцепились клюшками, арбитры разнимают бойцов!",
-    "💥 Мощное столкновение в нейтральной зоне: {def_p} прерывает скоростной рейд {att_p}!",
+    "💥 СОКРУШИТЕЛЬНЫЙ СИЛОВОЙ! <b>{def_p}</b> ({def_team}) впечатывает в борт форварда <b>{att_p}</b> ({att_team}) — стекла трещат!",
+    "💥 Зубодробительный прием на синей линии! <b>{def_p}</b> ({def_team}) жестко остановил <b>{att_p}</b> ({att_team})!",
+    "💥 <b>{def_p}</b> ({def_team}) эффектной мельницей роняет на лед мчащегося на скорости <b>{att_p}</b> ({att_team})!",
+    "⚡ Жаркая потасовка на пятаке ворот {def_team}! <b>{def_p}</b> и <b>{att_p}</b> сцепились в борьбе за шайбу!",
+    "💥 Мощное столкновение в центре площадки: <b>{def_p}</b> ({def_team}) сбивает атакующий порыв <b>{att_p}</b> ({att_team})!",
 
     # Атаки, пасы и комбинации
-    "🌪 {att_p} на сумасшедшей скорости прорезает оборону {def_team} и обыгрывает двоих на носовом платке!",
-    "🏒 {att_p} чертит гениальную диагональ через всю зону соперника — атака {att_team} дышит угрозой!",
-    "🌪 Молниеносный перехват в средней зоне! {att_p} устремляется в контратаку три в два!",
-    "⚡ {att_p} ложным замахом укладывает защитника на лед и с острого угла проверяет бдительность {def_g}!",
-    "🏒 Красивейшая позиционная осада ворот: {att_p} пасует за спину, разрывая оборону {def_team}!",
-    "🌪 Форчекинг в чужой зоне! {att_p} заставляет ошибиться {def_p} и мгновенно бросает по воротам!",
-    "⚡ {att_p} демонстрирует филигранный дриблинг за воротами {def_team} и отдает скрытую передачу на пятак!",
+    "🌪 <b>{att_p}</b> ({att_team}) на сумасшедшей скорости прорезает оборону соперника и обыгрывает двоих на носовом платке!",
+    "🏒 <b>{att_p}</b> ({att_team}) отдает скрытый диагональный пас, разрезая всю оборону {def_team}!",
+    "🌪 Молниеносный перехват в средней зоне! <b>{att_p}</b> ({att_team}) мчит в контратаку три в два!",
+    "⚡ <b>{att_p}</b> ({att_team}) ложным замахом укладывает защитника на лед и бросает с острого угла!",
+    "🏒 Затяжная позиционная осада в исполнении {att_team}: <b>{att_p}</b> опасно простреливает вдоль ворот {def_team}!",
+    "🌪 Острейший прессинг от {att_team}! <b>{att_p}</b> заставляет ошибиться защитника {def_p} ({def_team})!",
+    "⚡ <b>{att_p}</b> ({att_team}) демонстрирует филигранный дриблинг за воротами {def_team} и пасует на пятак!",
 
     # Курьезы и неудачи
-    "🏒 ДРАМА! У {att_p} трескается и разлетается пополам клюшка в момент броска по открытому углу ворот!",
-    "🌪 Неприятная осечка! {att_p} спотыкается на вираже у синей линии и теряет шайбу!",
-    "🏒 Шайба коварно встала на ребро и сходит с крюка форварда {att_p} перед воротами {def_g}!",
-    "🌪 Арбитр случайно срезал траекторию передачи {att_p}, прервав опасную комбинацию {att_team}!",
-    "🏒 {att_p} зарядил по воротам, но шайба угодила в конек своему же партнеру по звену!",
+    "🏒 ДРАМА! У <b>{att_p}</b> ({att_team}) трескается пополам клюшка в момент броска по открытому углу ворот!",
+    "🌪 Неприятная осечка! <b>{att_p}</b> ({att_team}) теряет равновесие у синей линии и упускает шайбу!",
+    "🏒 Шайба встала на ребро и предательски сходит с крюка нападающего <b>{att_p}</b> ({att_team})!",
+    "🌪 Арбитр случайно задел шайбу коньком у борта, сорвав перспективную атаку команды {att_team}!",
+    "🏒 <b>{att_p}</b> ({att_team}) щелкнул по воротам, но шайба угодила в коньки своему же партнеру по звену!",
 
     # Удаления и штрафное время
-    "⏱ СВИСТОК АРБИТРА! Задержка клюшкой! {def_p} отправляется на 2 минуты на скамейку штрафников!",
-    "⏱ {def_p} грубо фолит у борта против {att_p}! Судья фиксирует двухминутное удаление у {def_team}!",
-    "⏱ Опасная игра высоко поднятой клюшкой! {def_p} садится на скамейку, у {att_team} большинство!",
-    "⏱ {def_p} нарушает правила в борьбе с {att_p}! Отложенный штраф для {def_team}!"
+    "⏱ СВИСТОК СУДЬИ! Задержка клюшкой! <b>{def_p}</b> ({def_team}) удален на 2 минуты! Численное большинство у {att_team}!",
+    "⏱ <b>{def_p}</b> ({def_team}) грубо нарушает правила против <b>{att_p}</b>! {att_team} получает шанс в большинстве!",
+    "⏱ Опасная игра высоко поднятой клюшкой со стороны <b>{def_p}</b> ({def_team})! 2 минуты штрафа!",
+    "⏱ <b>{def_p}</b> ({def_team}) отправляется на скамейку штрафников за блокировку игрока <b>{att_p}</b> ({att_team})!"
 ]
 
+# Ясно и красиво расписанные шаблоны голов
 GOAL_EVENTS = [
-    "🚨 ГООООЛ! {att_p} точнейшим кистевым броском в паутинку снимает паука с девятки ворот {def_g}!",
-    "🚨 ГООООЛ! Мощнейший щелчок в касание от {att_p} прошивает сетку за спиной голкипера {def_g}!",
-    "🚨 ГООООЛ! {att_p} выигрывает ожесточенную борьбу на пятачке и добивает шайбу мимо {def_g}!",
-    "🚨 ГООООЛ! Шедевральный сольный проход {att_p}! На паузе обыграл вратаря {def_g} и закатил шайбу в пустые ворота!",
-    "🚨 ГООООЛ! Рикошет от клюшки защитника после броска {att_p} дезориентирует вратаря {def_g} — шайба в сетке!",
-    "🚨 ГООООЛ! Пушечный выстрел {att_p} под перекладину застает {def_g} врасплох!"
+    "🚨 <b>ГООООЛ забивает {att_team}!</b>\n   🎯 <b>{att_p}</b> ювелирным кистевым выстрелом в девятку прошивает вратаря {def_g} ({def_team})!",
+    "🚨 <b>ГООООЛ в ворота {def_team}!</b>\n   💥 <b>{att_p}</b> ({att_team}) мощнейшим щелчком в касание вонзает шайбу мимо {def_g}!",
+    "🚨 <b>ГООООЛ! {att_team} выходит вперед!</b>\n   🏒 <b>{att_p}</b> продавливает пятак и с мясом заталкивает шайбу за спину вратарю {def_g} ({def_team})!",
+    "🚨 <b>ГООООЛ забивает {att_team}!</b>\n   🌪 <b>{att_p}</b> на паузе обыгрывает голкипера {def_g} ({def_team}) и хладнокровно закатывает шайбу в пустые ворота!",
+    "🚨 <b>ГООООЛ! Шайба в сетке ворот {def_team}!</b>\n   ⚡ <b>{att_p}</b> ({att_team}) наносит пушечный бросок под перекладину, {def_g} бессилен!",
+    "🚨 <b>ГООООЛ забивает {att_team}!</b>\n   🎯 <b>{att_p}</b> идеально замыкает диагональную передачу на дальнюю штангу ворот {def_team}!"
 ]
 
 def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t1_roster: List[dict], t2_roster: List[dict]) -> dict:
@@ -404,7 +405,7 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
     prob1 = 0.50 + (diff * 0.02)
     prob1 = max(0.20, min(0.80, prob1))
 
-    # Base goals per period
+    # Goals per period
     p1_t1, p1_t2 = random.choices([0, 1, 2], weights=[0.55, 0.35, 0.10])[0], random.choices([0, 1, 2], weights=[0.55, 0.35, 0.10])[0]
     p2_t1, p2_t2 = random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0], random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0]
     p3_t1, p3_t2 = random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0], random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0]
@@ -453,7 +454,6 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
     else:
         winner = team1_name if score1 > score2 else team2_name
 
-    # Helper to get skaters & goalies
     def get_skaters_and_goalie(roster: List[dict]):
         g = next((c["name"] for c in roster if "goalie" in c.get("position", "").lower() or "врат" in c.get("position", "").lower()), roster[0]["name"])
         skaters = [c["name"] for c in roster if c["name"] != g] or [roster[0]["name"]]
@@ -462,7 +462,7 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
     t1_skaters, t1_g = get_skaters_and_goalie(t1_roster)
     t2_skaters, t2_g = get_skaters_and_goalie(t2_roster)
 
-    # Generate 4 events per period for deeper and longer action
+    # 4 events per period
     def generate_period_timeline(p_num: int, goals_t1: int, goals_t2: int):
         start_min = (p_num - 1) * 20 + 1
         end_min = p_num * 20
@@ -510,7 +510,7 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
                 def_p=def_p,
                 def_g=def_g
             )
-            events.append((m, desc))
+            events.append((m, desc, is_goal, att_t))
         return events
 
     p1_events = generate_period_timeline(1, p1_t1, p1_t2)
@@ -2090,7 +2090,6 @@ async def cb_search_game(callback: CallbackQuery):
         await callback.answer("У вас нет карточек для матча!", show_alert=True)
         return
 
-    # Extract clean 5 active cards for roster presentation
     active_cards = []
     goalie_c = lineup.get("goalie")
     if goalie_c:
@@ -2099,7 +2098,6 @@ async def cb_search_game(callback: CallbackQuery):
         if lineup.get(s):
             active_cards.append(lineup[s])
 
-    # Fallback to any 5 cards if lineup slots aren't full
     if len(active_cards) < 5:
         existing_ids = {c["id"] for c in active_cards}
         for c in all_cards:
@@ -2211,11 +2209,11 @@ async def run_game_session(player1: dict, player2: dict, is_pvp: bool = True):
 
     # 1 Period (4 events)
     accumulated_log.append("<b>━━━ 1-Й ПЕРИОД ━━━</b>")
-    for minute, text in res["p1_events"]:
+    for minute, text, is_goal, scoring_team in res["p1_events"]:
         await asyncio.sleep(2.2)
         accumulated_log.append(f"⏱ <b>{minute}'</b> {text}")
-        if "ГООООЛ" in text:
-            if player1["team_name"] in text:
+        if is_goal:
+            if scoring_team == player1["team_name"]:
                 cur_s1 += 1
             else:
                 cur_s2 += 1
@@ -2228,11 +2226,11 @@ async def run_game_session(player1: dict, player2: dict, is_pvp: bool = True):
 
     # 2 Period (4 events)
     accumulated_log.append("<b>━━━ 2-Й ПЕРИОД ━━━</b>")
-    for minute, text in res["p2_events"]:
+    for minute, text, is_goal, scoring_team in res["p2_events"]:
         await asyncio.sleep(2.2)
         accumulated_log.append(f"⏱ <b>{minute}'</b> {text}")
-        if "ГООООЛ" in text:
-            if player1["team_name"] in text:
+        if is_goal:
+            if scoring_team == player1["team_name"]:
                 cur_s1 += 1
             else:
                 cur_s2 += 1
@@ -2245,11 +2243,11 @@ async def run_game_session(player1: dict, player2: dict, is_pvp: bool = True):
 
     # 3 Period (4 events)
     accumulated_log.append("<b>━━━ 3-Й ПЕРИОД ━━━</b>")
-    for minute, text in res["p3_events"]:
+    for minute, text, is_goal, scoring_team in res["p3_events"]:
         await asyncio.sleep(2.2)
         accumulated_log.append(f"⏱ <b>{minute}'</b> {text}")
-        if "ГООООЛ" in text:
-            if player1["team_name"] in text:
+        if is_goal:
+            if scoring_team == player1["team_name"]:
                 cur_s1 += 1
             else:
                 cur_s2 += 1
@@ -2266,8 +2264,12 @@ async def run_game_session(player1: dict, player2: dict, is_pvp: bool = True):
 
         if res["ot_goal_by"]:
             scorer = res["ot_scorer"]
-            accumulated_log.append(f"⏱ <b>64'</b> 🚨 <b>ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!</b> {scorer} ({res['ot_goal_by']}) приносит победу!")
-            if res["ot_goal_by"] == p1_name:
+            scoring_team = res["ot_goal_by"]
+            defending_team = p2_name if scoring_team == p1_name else p1_name
+            accumulated_log.append(
+                f"⏱ <b>64'</b> 🚨 <b>ЗОЛОТОЙ ГОЛ В ОВЕРТАЙМЕ!</b>\n   🎯 <b>{scorer}</b> забивает за <b>{scoring_team}</b> в ворота {defending_team} и приносит триумфальную победу!"
+            )
+            if scoring_team == p1_name:
                 cur_s1 += 1
             else:
                 cur_s2 += 1
@@ -2280,7 +2282,10 @@ async def run_game_session(player1: dict, player2: dict, is_pvp: bool = True):
 
             winner_name = res["winner"]
             scorer = res["ot_scorer"]
-            accumulated_log.append(f"🎯 <b>ПОБЕДНЫЙ БУЛЛИТ!</b> {scorer} ({winner_name}) хладнокровно забивает победный буллит!")
+            losing_team = p2_name if winner_name == p1_name else p1_name
+            accumulated_log.append(
+                f"🎯 <b>ПОБЕДНЫЙ БУЛЛИТ!</b> <b>{scorer}</b> хладнокровно реализует попытку за <b>{winner_name}</b>, переиграв голкипера команды {losing_team}!"
+            )
             if winner_name == p1_name:
                 cur_s1 += 1
             else:
@@ -2363,7 +2368,6 @@ async def run_ai_game_session(player1: dict):
             ai_roster.append(random.choice(rem))
 
     if len(ai_roster) < 5:
-        # Default procedural AI cards if DB doesn't have enough
         ai_roster = [
             {"name": "Третьяк ИИ", "ovr": int(user_ovr), "position": "Goalie"},
             {"name": "Харламов ИИ", "ovr": int(user_ovr) + 1, "position": "Skater"},
