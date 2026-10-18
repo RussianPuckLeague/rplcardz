@@ -4,7 +4,7 @@ import logging
 import os
 import random
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -45,6 +45,28 @@ DAILY_RARITIES_CHANCES = {
     "Секретная": 0.00
 }
 
+# Rarity presentation and phrases
+RARITY_DETAILS = {
+    "Редкая":        ("🔷", "Неплохое начало! Карта уже в коллекции."),
+    "Очень редкая":  ("🔶", "Уже интереснее — такие карты попадаются нечасто!"),
+    "Эпическая":     ("🟣", "Эпическая карта! Это серьёзное усиление состава."),
+    "Мифическая":    ("🔴", "МИФИЧЕСКАЯ карта! Такие на рынке стоят дорого."),
+    "Легендарная":   ("🌟", "ЛЕГЕНДАРНАЯ карта! Поздравляем — это большая удача!"),
+    "Секретная":     ("👑", "СЕКРЕТНАЯ карта! Практически невозможно достать.")
+}
+
+# UI Sections for admin customizable block photos
+AVAILABLE_BLOCKS = {
+    "main_menu": "🏠 Главное меню / Профиль",
+    "casino": "🎰 Казино",
+    "jobs": "💼 Раздел работ",
+    "market": "🏪 Рынок карточек",
+    "roster": "🏒 Состав команды (4+1)",
+    "streak": "🎁 Ежедневные призы (7 дней)",
+    "packs": "📦 Магазин паков",
+    "leaderboard": "🏆 Рейтинг MMR"
+}
+
 STREAK_REWARDS = {
     1: {"type": "coins", "amount": 2500, "desc": "2 500 RPLCoin"},
     2: {"type": "coins", "amount": 5000, "desc": "5 000 RPLCoin"},
@@ -77,6 +99,33 @@ def calculate_level_and_progress(total_exp: int) -> Tuple[int, int, int]:
         lvl += 1
         req += 1000
     return lvl, rem, req
+
+# ==================== CARD DROP FORMATTER ====================
+def format_card_drop(card: dict) -> str:
+    r_rarity = card.get("rarity", "Редкая")
+    r_icon, r_phrase = RARITY_DETAILS.get(r_rarity, ("⭐", "Отличное пополнение вашей коллекции!"))
+
+    pos_raw = card.get("position", "Skater")
+    if "goalie" in pos_raw.lower() or "врат" in pos_raw.lower():
+        pos_display = "Вратарь"
+    else:
+        pos_display = "Полевой игрок"
+
+    return (
+        "🎴 ━━━━━━━━━━━ 🎴\n"
+        "        ✦ КАРТА ПОЛУЧЕНА ✦\n"
+        "🎴 ━━━━━━━━━━━ 🎴\n\n"
+        f"   🏒  <b>{html.escape(card.get('name', 'Игрок'))}</b>\n"
+        f"   🌍  {html.escape(card.get('country', 'СНГ'))}\n\n"
+        f"   ├ Позиция: <b>{pos_display}</b>\n"
+        f"   ├ Рейтинг:  <b>{card.get('ovr', 70)}</b>\n"
+        f"   ├ Команда:  <b>{html.escape(card.get('team_name', 'Без команды'))}</b>\n"
+        f"   ├ Коллекция: <b>{html.escape(card.get('collection_name', 'Основная'))}</b>\n"
+        f"   └ Редкость: {r_icon} <b>{html.escape(r_rarity)}</b>\n\n"
+        "🎴 ━━━━━━━━━━━━━━━━━━━━ 🎴\n\n"
+        "✨ +50XP за карту\n\n"
+        f"{r_icon} <i>{r_phrase}</i>"
+    )
 
 # ==================== DATABASE & AUTO-MIGRATIONS ====================
 class Database:
@@ -185,6 +234,11 @@ class Database:
                     price BIGINT NOT NULL,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+
+                CREATE TABLE IF NOT EXISTS ui_blocks (
+                    block_key VARCHAR(50) PRIMARY KEY,
+                    photo_id TEXT
+                );
             """)
 
             await conn.execute("""
@@ -203,11 +257,67 @@ class Database:
                 ALTER TABLE cards ALTER COLUMN photo_id DROP NOT NULL;
                 ALTER TABLE teams ADD COLUMN IF NOT EXISTS photo_id TEXT;
                 ALTER TABLE user_cards ADD COLUMN IF NOT EXISTS slot VARCHAR(20);
+                CREATE TABLE IF NOT EXISTS ui_blocks (block_key VARCHAR(50) PRIMARY KEY, photo_id TEXT);
                 CREATE UNIQUE INDEX IF NOT EXISTS user_cards_user_card_uniq ON user_cards (user_id, card_id);
             """)
             logger.info("Database schemas and auto-migrations verified successfully.")
 
 db = Database(DATABASE_URL)
+
+# ==================== BLOCK PHOTO HELPERS ====================
+async def get_block_photo(block_key: str) -> Optional[str]:
+    try:
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT photo_id FROM ui_blocks WHERE block_key = $1", block_key)
+            if row and row["photo_id"]:
+                return row["photo_id"]
+    except Exception as e:
+        logger.error(f"Error fetching block photo for {block_key}: {e}")
+    return None
+
+async def show_screen(
+    target: Union[Message, CallbackQuery],
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    block_key: Optional[str] = None,
+    direct_photo: Optional[str] = None
+):
+    photo_id = direct_photo or (await get_block_photo(block_key) if block_key else None)
+
+    if isinstance(target, CallbackQuery):
+        msg = target.message
+        if photo_id:
+            if msg.photo:
+                try:
+                    await msg.edit_media(
+                        media=InputMediaPhoto(media=photo_id, caption=text, parse_mode=ParseMode.HTML),
+                        reply_markup=reply_markup
+                    )
+                    return
+                except Exception:
+                    pass
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await msg.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        else:
+            if msg.photo:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                await msg.answer(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            else:
+                try:
+                    await msg.edit_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await msg.answer(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    else:  # Message
+        if photo_id:
+            await target.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        else:
+            await target.answer(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 # ==================== FSM STATES ====================
 class RegState(StatesGroup):
@@ -249,6 +359,9 @@ class AdminPromoState(StatesGroup):
 class AdminStartersState(StatesGroup):
     card_ids = State()
 
+class AdminBlockState(StatesGroup):
+    waiting_photo = State()
+
 class UserPromoState(StatesGroup):
     code = State()
 
@@ -274,7 +387,7 @@ async def grant_starter_cards_for_user(conn, user_id: int):
         if len(starters_list) < 5:
             existing_ids = [s["id"] for s in starters_list] or [0]
             has_goalie = any("goalie" in s.get("position", "").lower() or "врат" in s.get("position", "").lower() for s in starters_list)
-            
+
             if not has_goalie:
                 extra_g = await conn.fetch("""
                     SELECT id, position FROM cards 
@@ -331,7 +444,6 @@ async def grant_starter_cards_for_user(conn, user_id: int):
 
 # ==================== 50+ DYNAMIC MATCH EVENTS ====================
 MATCH_EVENTS_CATALOG = [
-    # Броски, штанги, перекладины
     "🎯 Звонкая ШТАНГА! <b>{att_p}</b> ({att_team}) сотрясает каркас ворот {def_team} кистевым выстрелом!",
     "💥 ПЕРЕКЛАДИНА! <b>{att_p}</b> ({att_team}) зарядил щелчком от синей линии — ворота {def_team} звенят на всю арену!",
     "🏒 <b>{att_p}</b> ({att_team}) выкатывается из-за ворот и бросает с неудобной руки — штанга спасает {def_team}!",
@@ -342,8 +454,7 @@ MATCH_EVENTS_CATALOG = [
     "🏒 <b>{att_p}</b> ({att_team}) замыкает прострел на дальнем пятаке — звон штанги ворот {def_team}!",
     "🎯 Хитрый бросок <b>{att_p}</b> ({att_team}) из-под защитника {def_p} — каркас спасает {def_team}!",
 
-    # Сейвы вратарей
-    "🧤 ЧУДЕСНЫЙ СЕЙВ! Вратарь <b>{def_g}</b> ({def_team}) в феноменальном шпагате достает мертвую шайбу после броска <b>{att_p}</b> ({att_team})!",
+    "🧤 ЧУДЕСНЫЙ СЕЙВ! Вратарь <b>{def_g}</b> ({def_team}) в феноменальном шпагате достает шайбу после броска <b>{att_p}</b> ({att_team})!",
     "🧤 Голкипер <b>{def_g}</b> ({def_team}) намертво фиксирует шайбу ловушкой, ликвидировав выход один в один от <b>{att_p}</b> ({att_team})!",
     "🛡 Вратарь <b>{def_g}</b> ({def_team}) щитком парирует коварное добивание форварда <b>{att_p}</b> ({att_team})!",
     "🧤 Невероятный рефлекс! <b>{def_g}</b> ({def_team}) блином переводит через стекло мощнейший выстрел <b>{att_p}</b> ({att_team})!",
@@ -353,21 +464,18 @@ MATCH_EVENTS_CATALOG = [
     "🧤 <b>{def_g}</b> ({def_team}) закрывает 'домик' щитками и не пускает шайбу после резкого виража <b>{att_p}</b> ({att_team})!",
     "🛡 Голкипер <b>{def_g}</b> ({def_team}) в отчаянном прыжке парирует щелчок форварда <b>{att_p}</b> ({att_team})!",
 
-    # Блокировки и действия защиты
     "🛡 Защитник <b>{def_p}</b> ({def_team}) бросается под пушечный щелчок <b>{att_p}</b> ({att_team}) и спасает ворота!",
     "🛡 <b>{def_p}</b> ({def_team}) ювелирно подбивает клюшку игроку <b>{att_p}</b> ({att_team}) в момент броска по открытому углу!",
     "🛡 <b>{def_p}</b> ({def_team}) намертво вяжет форварда <b>{att_p}</b> на пятаке и прерывает острейшую атаку {att_team}!",
     "🛡 Самоотверженный блок-шот! <b>{def_p}</b> ({def_team}) телом блокирует щелчок <b>{att_p}</b> ({att_team})!",
     "🛡 Защитник <b>{def_p}</b> ({def_team}) чисто выбивает шайбу при выходе <b>{att_p}</b> ({att_team}) на рандеву с вратарем!",
 
-    # Силовые приемы и борьба
     "💥 СОКРУШИТЕЛЬНЫЙ СИЛОВОЙ! <b>{def_p}</b> ({def_team}) впечатывает в борт форварда <b>{att_p}</b> ({att_team}) — стекла трещат!",
     "💥 Зубодробительный прием на синей линии! <b>{def_p}</b> ({def_team}) жестко остановил <b>{att_p}</b> ({att_team})!",
     "💥 <b>{def_p}</b> ({def_team}) эффектной мельницей роняет на лед мчащегося на скорости <b>{att_p}</b> ({att_team})!",
     "⚡ Жаркая потасовка на пятаке ворот {def_team}! <b>{def_p}</b> и <b>{att_p}</b> сцепились в борьбе за шайбу!",
     "💥 Мощное столкновение в центре площадки: <b>{def_p}</b> ({def_team}) сбивает атакующий порыв <b>{att_p}</b> ({att_team})!",
 
-    # Атаки, пасы и комбинации
     "🌪 <b>{att_p}</b> ({att_team}) на сумасшедшей скорости прорезает оборону соперника и обыгрывает двоих на носовом платке!",
     "🏒 <b>{att_p}</b> ({att_team}) отдает скрытый диагональный пас, разрезая всю оборону {def_team}!",
     "🌪 Молниеносный перехват в средней зоне! <b>{att_p}</b> ({att_team}) мчит в контратаку три в два!",
@@ -376,21 +484,18 @@ MATCH_EVENTS_CATALOG = [
     "🌪 Острейший прессинг от {att_team}! <b>{att_p}</b> заставляет ошибиться защитника {def_p} ({def_team})!",
     "⚡ <b>{att_p}</b> ({att_team}) демонстрирует филигранный дриблинг за воротами {def_team} и пасует на пятак!",
 
-    # Курьезы и неудачи
     "🏒 ДРАМА! У <b>{att_p}</b> ({att_team}) трескается пополам клюшка в момент броска по открытому углу ворот!",
     "🌪 Неприятная осечка! <b>{att_p}</b> ({att_team}) теряет равновесие у синей линии и упускает шайбу!",
     "🏒 Шайба встала на ребро и предательски сходит с крюка нападающего <b>{att_p}</b> ({att_team})!",
-    "🌪 Арбитр случайно задел шайбу коньком у борта, сорвав перспективную атаку команды {att_team}!",
+    "🌪 Арбитр случайно задел шайбу коньком у борта, сорвав атаку команды {att_team}!",
     "🏒 <b>{att_p}</b> ({att_team}) щелкнул по воротам, но шайба угодила в коньки своему же партнеру по звену!",
 
-    # Удаления и штрафное время
     "⏱ СВИСТОК СУДЬИ! Задержка клюшкой! <b>{def_p}</b> ({def_team}) удален на 2 минуты! Численное большинство у {att_team}!",
     "⏱ <b>{def_p}</b> ({def_team}) грубо нарушает правила против <b>{att_p}</b>! {att_team} получает шанс в большинстве!",
     "⏱ Опасная игра высоко поднятой клюшкой со стороны <b>{def_p}</b> ({def_team})! 2 минуты штрафа!",
     "⏱ <b>{def_p}</b> ({def_team}) отправляется на скамейку штрафников за блокировку игрока <b>{att_p}</b> ({att_team})!"
 ]
 
-# Ясно и красиво расписанные шаблоны голов
 GOAL_EVENTS = [
     "🚨 <b>ГООООЛ забивает {att_team}!</b>\n   🎯 <b>{att_p}</b> ювелирным кистевым выстрелом в девятку прошивает вратаря {def_g} ({def_team})!",
     "🚨 <b>ГООООЛ в ворота {def_team}!</b>\n   💥 <b>{att_p}</b> ({att_team}) мощнейшим щелчком в касание вонзает шайбу мимо {def_g}!",
@@ -405,7 +510,6 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
     prob1 = 0.50 + (diff * 0.02)
     prob1 = max(0.20, min(0.80, prob1))
 
-    # Goals per period
     p1_t1, p1_t2 = random.choices([0, 1, 2], weights=[0.55, 0.35, 0.10])[0], random.choices([0, 1, 2], weights=[0.55, 0.35, 0.10])[0]
     p2_t1, p2_t2 = random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0], random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0]
     p3_t1, p3_t2 = random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0], random.choices([0, 1, 2], weights=[0.50, 0.35, 0.15])[0]
@@ -462,7 +566,6 @@ def simulate_match(team1_name: str, ovr1: float, team2_name: str, ovr2: float, t
     t1_skaters, t1_g = get_skaters_and_goalie(t1_roster)
     t2_skaters, t2_g = get_skaters_and_goalie(t2_roster)
 
-    # 4 events per period
     def generate_period_timeline(p_num: int, goals_t1: int, goals_t2: int):
         start_min = (p_num - 1) * 20 + 1
         end_min = p_num * 20
@@ -629,6 +732,7 @@ def cis_countries_keyboard() -> InlineKeyboardMarkup:
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Блоки (Фото разделов)", callback_data="adm_blocks")],
         [InlineKeyboardButton(text="⭐ Назначить начальных игроков", callback_data="adm_starters")],
         [InlineKeyboardButton(text="⚡ Автодобавление карточек", callback_data="adm_card_batch")],
         [InlineKeyboardButton(text="➕ Создать карточку (Вручную)", callback_data="adm_card_manual")],
@@ -753,7 +857,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
             is_private = (message.chat.type == ChatType.PRIVATE)
             text = render_profile_text(user, user_name)
-            await message.answer(text, reply_markup=main_menu_keyboard(is_private), parse_mode=ParseMode.HTML)
+            await show_screen(message, text, reply_markup=main_menu_keyboard(is_private), block_key="main_menu")
         else:
             await state.set_state(RegState.entering_team_name)
             await message.answer(
@@ -802,12 +906,11 @@ async def process_country_choice(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     profile_text = render_profile_text(user, player_name)
-    await callback.message.edit_text(
+    full_text = (
         f"🎉 <b>Команда успешно зарегистрирована!</b>\n"
-        f"Вам выданы 5 стартовых карточек полного звена (4 полевых + 1 вратарь)!\n\n{profile_text}",
-        reply_markup=main_menu_keyboard(callback.message.chat.type == ChatType.PRIVATE),
-        parse_mode=ParseMode.HTML
+        f"Вам выданы 5 стартовых карточек полного звена (4 полевых + 1 вратарь)!\n\n{profile_text}"
     )
+    await show_screen(callback, full_text, reply_markup=main_menu_keyboard(callback.message.chat.type == ChatType.PRIVATE), block_key="main_menu")
 
 # ==================== MAIN MENU NAVIGATION ====================
 @dp.callback_query(F.data == "back_main")
@@ -821,11 +924,7 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext):
 
     text = render_profile_text(user, callback.from_user.full_name)
     is_private = (callback.message.chat.type == ChatType.PRIVATE)
-    if callback.message.photo:
-        await callback.message.delete()
-        await callback.message.answer(text, reply_markup=main_menu_keyboard(is_private), parse_mode=ParseMode.HTML)
-    else:
-        await callback.message.edit_text(text, reply_markup=main_menu_keyboard(is_private), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=main_menu_keyboard(is_private), block_key="main_menu")
 
 # ==================== /CARD COMMAND & CLAIM LOGIC ====================
 async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
@@ -876,38 +975,25 @@ async def execute_card_claim(user_id: int) -> Tuple[bool, str, Optional[str]]:
         if not available_cards:
             return False, "🏆 Невероятно! Вы собрали абсолютно все доступные карточки в игре!", None
 
-        card = random.choice(available_cards)
+        card = dict(random.choice(available_cards))
+        # Give card and award +50 XP
         await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, card["id"])
-        await conn.execute("UPDATE users SET last_daily_claim = $1, notified_cd = FALSE WHERE user_id = $2", now, user_id)
+        await conn.execute("UPDATE users SET last_daily_claim = $1, notified_cd = FALSE, exp = exp + 50 WHERE user_id = $2", now, user_id)
 
-    caption = (
-        f"🎁 <b>Вам выпала новая карточка!</b>\n\n"
-        f"🌟 <b>{html.escape(card['name'])}</b> (OVR: {card['ovr']})\n"
-        f"Позиция: <b>{html.escape(card['position'])}</b> | Редкость: <b>{html.escape(card['rarity'])}</b>\n"
-        f"Команда: <b>{html.escape(card['team_name'])}</b> | Коллекция: <b>{html.escape(card['collection_name'])}</b>\n"
-        f"Страна: <b>{html.escape(card['country'])}</b>\n\n"
-        f"✅ Карточка сохранена в вашей коллекции!"
-    )
-    return True, caption, card["effective_photo"]
+    formatted_card_text = format_card_drop(card)
+    return True, formatted_card_text, card["effective_photo"]
 
 @dp.message(Command("card"))
 async def cmd_card(message: Message):
     success, text, photo_id = await execute_card_claim(message.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
-    if photo_id:
-        await message.answer_photo(photo=photo_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    else:
-        await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(message, text, reply_markup=kb, direct_photo=photo_id)
 
 @dp.callback_query(F.data == "claim_daily_btn")
 async def cb_claim_daily(callback: CallbackQuery):
     success, text, photo_id = await execute_card_claim(callback.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
-    if photo_id:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=photo_id, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    else:
-        await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, text, reply_markup=kb, direct_photo=photo_id)
 
 # ==================== BACKGROUND 12-HOUR CD NOTIFIER ====================
 async def card_cooldown_notifier():
@@ -985,6 +1071,9 @@ async def cb_streak_rewards(callback: CallbackQuery):
                 streak_to_claim = 1
 
         reward_info = STREAK_REWARDS[streak_to_claim]
+        card_received_text = None
+        card_photo = None
+
         if reward_info["type"] == "coins":
             await conn.execute("""
                 UPDATE users 
@@ -992,7 +1081,6 @@ async def cb_streak_rewards(callback: CallbackQuery):
                 WHERE user_id = $4
             """, reward_info["amount"], streak_to_claim, now, user_id)
             bonus_str = f"Вам начислено <b>{reward_info['amount']} RPLCoin</b>!"
-            card_photo = None
         else:
             min_o, max_o = reward_info["min_ovr"], reward_info["max_ovr"]
             free_cards = await conn.fetch("""
@@ -1004,14 +1092,15 @@ async def cb_streak_rewards(callback: CallbackQuery):
             """, min_o, max_o, user_id)
 
             if free_cards:
-                c = random.choice(free_cards)
+                c = dict(random.choice(free_cards))
                 await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, c["id"])
-                bonus_str = f"Вам выпала карточка <b>{html.escape(c['name'])}</b> (OVR: {c['ovr']}, {c['rarity']})!"
+                await conn.execute("UPDATE users SET exp = exp + 50 WHERE user_id = $1", user_id)
+                card_received_text = format_card_drop(c)
                 card_photo = c["effective_photo"]
+                bonus_str = f"Вам выпала карточка <b>{html.escape(c['name'])}</b> (OVR: {c['ovr']}, {c['rarity']})!"
             else:
                 await conn.execute("UPDATE users SET rpl_coins = rpl_coins + 15000 WHERE user_id = $1", user_id)
                 bonus_str = "Все карточки этого диапазона уже у вас! Начислена компенсация <b>15 000 RPLCoin</b>."
-                card_photo = None
 
             await conn.execute("UPDATE users SET streak_days = $1, last_streak_claim = $2 WHERE user_id = $3", streak_to_claim, now, user_id)
 
@@ -1028,12 +1117,11 @@ async def cb_streak_rewards(callback: CallbackQuery):
         f"{bonus_str}"
     )
 
+    if card_received_text:
+        schedule_text += f"\n\n{card_received_text}"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]])
-    if card_photo:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=card_photo, caption=schedule_text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await callback.message.edit_text(schedule_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, schedule_text, reply_markup=kb, block_key="streak", direct_photo=card_photo)
 
 # ==================== ROSTER 4+1 ====================
 @dp.callback_query(F.data == "view_roster")
@@ -1069,7 +1157,7 @@ async def cb_view_roster(callback: CallbackQuery):
         buttons.append([InlineKeyboardButton(text="✏️ Редактировать состав в ЛС", url=f"https://t.me/{bot_user.username}?start=roster")])
 
     buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), block_key="roster")
 
 @dp.callback_query(F.data.startswith("pick_slot:"))
 async def cb_pick_slot(callback: CallbackQuery):
@@ -1096,12 +1184,13 @@ async def cb_pick_slot(callback: CallbackQuery):
         )])
 
     buttons.append([InlineKeyboardButton(text="🔙 Назад к составу", callback_data="view_roster")])
-    await callback.message.edit_text(
+    await show_screen(
+        callback,
         f"🏒 <b>Выбор игрока на позицию: {SLOT_NAMES[slot]}</b>\n"
         f"Требуемая позиция: <b>{req_pos}</b>\n\n"
         f"Выберите карточку из доступных:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode=ParseMode.HTML
+        block_key="roster"
     )
 
 @dp.callback_query(F.data.startswith("set_slot:"))
@@ -1126,13 +1215,12 @@ async def cmd_market(message: Message):
         [InlineKeyboardButton(text="📦 Мои лоты на продаже", callback_data="market_my_listings")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
-    await message.answer(
+    text = (
         "🏪 <b>ТОРГОВАЯ ПЛОЩАДКА RPL</b>\n\n"
         "Здесь игроки могут свободно покупать и продавать любые карточки за RPLCoin!\n\n"
-        "Выберите раздел:",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML
+        "Выберите раздел:"
     )
+    await show_screen(message, text, reply_markup=kb, block_key="market")
 
 @dp.callback_query(F.data == "market_menu")
 async def cb_market_menu(callback: CallbackQuery):
@@ -1147,11 +1235,7 @@ async def cb_market_menu(callback: CallbackQuery):
         "Здесь игроки могут свободно покупать и продавать любые карточки за RPLCoin!\n\n"
         "Выберите раздел:"
     )
-    if callback.message.photo:
-        await callback.message.delete()
-        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=kb, block_key="market")
 
 @dp.callback_query(F.data.startswith("market_browse:"))
 async def cb_market_browse(callback: CallbackQuery):
@@ -1181,7 +1265,7 @@ async def cb_market_browse(callback: CallbackQuery):
             [InlineKeyboardButton(text="🏷 Выставить свою карту", callback_data="market_sell_list")],
             [InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")]
         ])
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await show_screen(callback, text, reply_markup=kb, block_key="market")
         return
 
     text = f"🛒 <b>ТОРГОВАЯ ПЛОЩАДКА (Стр. {page + 1})</b>\nНажмите на лот для покупки:\n\n"
@@ -1199,7 +1283,7 @@ async def cb_market_browse(callback: CallbackQuery):
         buttons.append(nav_row)
 
     buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), block_key="market")
 
 @dp.callback_query(F.data.startswith("market_view:"))
 async def cb_market_view(callback: CallbackQuery):
@@ -1234,12 +1318,7 @@ async def cb_market_view(callback: CallbackQuery):
         [InlineKeyboardButton(text=f"💳 Купить за {item['price']} RPL", callback_data=f"market_buy:{item['listing_id']}")],
         [InlineKeyboardButton(text="🔙 К списку лотов", callback_data="market_browse:0")]
     ])
-
-    if item["effective_photo"]:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=item["effective_photo"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=kb, direct_photo=item["effective_photo"])
 
 @dp.callback_query(F.data.startswith("market_buy:"))
 async def cb_market_buy(callback: CallbackQuery):
@@ -1311,7 +1390,7 @@ async def cb_market_sell_list(callback: CallbackQuery):
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"market_select_card:{c['id']}")])
 
     buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), block_key="market")
 
 @dp.callback_query(F.data.startswith("market_select_card:"))
 async def cb_market_select_card(callback: CallbackQuery, state: FSMContext):
@@ -1322,12 +1401,13 @@ async def cb_market_select_card(callback: CallbackQuery, state: FSMContext):
     async with db.pool.acquire() as conn:
         card = await conn.fetchrow("SELECT name, ovr, rarity FROM cards WHERE id = $1", card_id)
 
-    await callback.message.edit_text(
+    await show_screen(
+        callback,
         f"🏷 Продажа карточки: <b>{html.escape(card['name'])}</b> (OVR {card['ovr']}, {card['rarity']})\n\n"
         f"Введите <b>цену в RPLCoin</b>, за которую хотите выставить эту карточку:\n"
         f"<i>(Вы можете указать любую желаемую сумму от 100 RPL)</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="market_menu")]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="market_menu")]]),
+        block_key="market"
     )
 
 @dp.message(MarketSellState.price)
@@ -1384,7 +1464,7 @@ async def cb_market_my_listings(callback: CallbackQuery):
             [InlineKeyboardButton(text="🏷 Выставить карту", callback_data="market_sell_list")],
             [InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")]
         ])
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await show_screen(callback, text, reply_markup=kb, block_key="market")
         return
 
     text = "📦 <b>МОИ ЛОТЫ НА ПРОДАЖЕ</b>\nНажмите на лот, чтобы снять его с продажи и вернуть карту:\n\n"
@@ -1395,7 +1475,7 @@ async def cb_market_my_listings(callback: CallbackQuery):
             callback_data=f"market_cancel:{it['listing_id']}"
         )])
     buttons.append([InlineKeyboardButton(text="🔙 Назад к рынку", callback_data="market_menu")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), block_key="market")
 
 @dp.callback_query(F.data.startswith("market_cancel:"))
 async def cb_market_cancel(callback: CallbackQuery):
@@ -1431,22 +1511,22 @@ async def cb_casino_menu(callback: CallbackQuery):
         "• Проигрыш [75%]\n\n"
         "Выберите игру:"
     )
-    if callback.message.photo:
-        await callback.message.delete()
-        await callback.message.answer(text, reply_markup=casino_menu_keyboard(), parse_mode=ParseMode.HTML)
-    else:
-        await callback.message.edit_text(text, reply_markup=casino_menu_keyboard(), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=casino_menu_keyboard(), block_key="casino")
 
 # --- 1. Eagle & Tails (/coin) ---
 @dp.callback_query(F.data == "casino_coin")
 async def cb_casino_coin(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CoinState.bet)
-    await callback.message.edit_text(
+    text = (
         "🦅 <b>ОРЁЛ И РЕШКА (/coin)</b>\n\n"
         "Введите сумму ставки в RPLCoin:\n"
-        "<i>Шанс победы: 20% | Множитель: x4</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        "<i>Шанс победы: 20% | Множитель: x4</i>"
+    )
+    await show_screen(
+        callback,
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+        block_key="casino"
     )
 
 @dp.message(Command("coin"))
@@ -1457,9 +1537,11 @@ async def cmd_coin(message: Message, state: FSMContext):
         await process_coin_bet_value(message, state, bet)
     else:
         await state.set_state(CoinState.bet)
-        await message.answer(
+        await show_screen(
+            message,
             "🦅 <b>ОРЁЛ И РЕШКА</b>\n\nВведите сумму ставки в RPLCoin:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+            block_key="casino"
         )
 
 @dp.message(CoinState.bet)
@@ -1534,18 +1616,22 @@ async def cb_coin_play(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔄 Сыграть снова", callback_data="casino_coin")],
         [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
     ])
-    await callback.message.edit_text(res_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, res_text, reply_markup=kb, block_key="casino")
 
 # --- 2. Rock Paper Scissors (/rps) ---
 @dp.callback_query(F.data == "casino_rps")
 async def cb_casino_rps(callback: CallbackQuery, state: FSMContext):
     await state.set_state(RpsState.bet)
-    await callback.message.edit_text(
+    text = (
         "✂️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА (/rps)</b>\n\n"
         "Введите сумму ставки в RPLCoin:\n"
-        "<i>Шансы: 42% победа (+ставка) | 16% ничья | 42% поражение (-ставка)</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        "<i>Шансы: 42% победа (+ставка) | 16% ничья | 42% поражение (-ставка)</i>"
+    )
+    await show_screen(
+        callback,
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+        block_key="casino"
     )
 
 @dp.message(Command("rps"))
@@ -1555,9 +1641,11 @@ async def cmd_rps(message: Message, state: FSMContext):
         await process_rps_bet_value(message, state, int(args[1]))
     else:
         await state.set_state(RpsState.bet)
-        await message.answer(
+        await show_screen(
+            message,
             "✂️ <b>КАМЕНЬ-НОЖНИЦЫ-БУМАГА</b>\n\nВведите сумму ставки в RPLCoin:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+            block_key="casino"
         )
 
 @dp.message(RpsState.bet)
@@ -1641,13 +1729,13 @@ async def cb_rps_play(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🔄 Сыграть снова", callback_data="casino_rps")],
         [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=kb, block_key="casino")
 
 # --- 3. Slots (/slots) ---
 @dp.callback_query(F.data == "casino_slots")
 async def cb_casino_slots(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SlotsState.bet)
-    await callback.message.edit_text(
+    text = (
         "🎰 <b>ХОККЕЙНЫЕ СЛОТЫ (/slots)</b>\n\n"
         "Символы: 🏒 🥅 ⭐️ 🍒 7️⃣ 💎\n\n"
         "Шансы выигрыша:\n"
@@ -1655,9 +1743,13 @@ async def cb_casino_slots(callback: CallbackQuery, state: FSMContext):
         "• 3 любых одинаковых [7%] — <b>множитель x5</b>\n"
         "• 2 одинаковых символа [15%] — <b>множитель x2</b>\n"
         "• Проигрыш [75%]\n\n"
-        "Введите сумму ставки:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+        "Введите сумму ставки:"
+    )
+    await show_screen(
+        callback,
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+        block_key="casino"
     )
 
 @dp.message(Command("slots"))
@@ -1667,9 +1759,11 @@ async def cmd_slots(message: Message, state: FSMContext):
         await run_slots_spin(message, int(args[1]))
     else:
         await state.set_state(SlotsState.bet)
-        await message.answer(
+        await show_screen(
+            message,
             "🎰 <b>СЛОТЫ</b>\n\nВведите сумму ставки в RPLCoin:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="casino_menu")]]),
+            block_key="casino"
         )
 
 @dp.message(SlotsState.bet)
@@ -1739,7 +1833,7 @@ async def run_slots_spin(message: Message, bet: int):
         [InlineKeyboardButton(text="🔄 Крутить снова", callback_data="casino_slots")],
         [InlineKeyboardButton(text="🎰 В меню казино", callback_data="casino_menu")]
     ])
-    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(message, text, reply_markup=kb, block_key="casino")
 
 # ==================== JOBS SYSTEM ====================
 async def check_jail(user_id: int) -> Tuple[bool, str]:
@@ -1758,7 +1852,7 @@ async def cb_jobs_menu(callback: CallbackQuery):
     is_in_jail, jail_msg = await check_jail(callback.from_user.id)
     if is_in_jail:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await show_screen(callback, jail_msg, reply_markup=kb, block_key="jobs")
         return
 
     text = (
@@ -1770,7 +1864,7 @@ async def cb_jobs_menu(callback: CallbackQuery):
         "🎟 <b>Продавец атрибутики</b> — выбор цены товара и выручки (КД 2ч)\n\n"
         "Выберите желаемую работу:"
     )
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=jobs_menu_keyboard())
+    await show_screen(callback, text, reply_markup=jobs_menu_keyboard(), block_key="jobs")
 
 # --- 1. Coach Job ---
 @dp.callback_query(F.data == "job_coach")
@@ -1778,7 +1872,7 @@ async def cb_job_coach(callback: CallbackQuery):
     user_id = callback.from_user.id
     is_in_jail, jail_msg = await check_jail(user_id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -1816,14 +1910,14 @@ async def cb_job_coach(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
-    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, res_text, reply_markup=kb, block_key="jobs")
 
 # --- 2. Illegal Jobs ---
 @dp.callback_query(F.data == "job_illegal_menu")
 async def cb_job_illegal_menu(callback: CallbackQuery):
     is_in_jail, jail_msg = await check_jail(callback.from_user.id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -1856,7 +1950,7 @@ async def cb_job_illegal_menu(callback: CallbackQuery):
         "<i>После успеха или неудачи без ареста — КД 12 часов.</i>\n"
         "Выберите дело на свой страх и риск:"
     )
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=illegal_menu_keyboard())
+    await show_screen(callback, text, reply_markup=illegal_menu_keyboard(), block_key="jobs")
 
 @dp.callback_query(F.data.startswith("do_illegal:"))
 async def cb_do_illegal(callback: CallbackQuery):
@@ -1865,7 +1959,7 @@ async def cb_do_illegal(callback: CallbackQuery):
 
     is_in_jail, jail_msg = await check_jail(user_id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -1901,7 +1995,7 @@ async def cb_do_illegal(callback: CallbackQuery):
             else:
                 outcome = "jail"
                 gain = 0
-        else: # shop
+        else:  # shop
             if roll < 0.30:
                 outcome = "success"
                 gain = random.randint(4000, 15000)
@@ -1928,7 +2022,7 @@ async def cb_do_illegal(callback: CallbackQuery):
                 "❌ Выручка: 0 RPLCoin\n"
                 "⏳ Кулдаун: 12 часов."
             )
-        else: # jail
+        else:  # jail
             jail_time = now + timedelta(hours=48)
             await conn.execute("UPDATE users SET jail_until = $1, job_illegal_cd = $2 WHERE user_id = $3", jail_time, now, user_id)
             res_text = (
@@ -1942,7 +2036,7 @@ async def cb_do_illegal(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
-    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, res_text, reply_markup=kb, block_key="jobs")
 
 # --- 3. Sports Photographer Job ---
 @dp.callback_query(F.data == "job_photo")
@@ -1950,7 +2044,7 @@ async def cb_job_photo(callback: CallbackQuery):
     user_id = callback.from_user.id
     is_in_jail, jail_msg = await check_jail(user_id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -1988,14 +2082,14 @@ async def cb_job_photo(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
-    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, res_text, reply_markup=kb, block_key="jobs")
 
 # --- 4. Merch Seller Job ---
 @dp.callback_query(F.data == "job_merch_menu")
 async def cb_job_merch_menu(callback: CallbackQuery):
     is_in_jail, jail_msg = await check_jail(callback.from_user.id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -2019,7 +2113,7 @@ async def cb_job_merch_menu(callback: CallbackQuery):
         "• <b>Дорогая</b> — 15% шанс продажи, выручка 8 000–12 000 RPLCoin\n\n"
         "⏳ Кулдаун: 2 часа."
     )
-    await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=merch_menu_keyboard())
+    await show_screen(callback, text, reply_markup=merch_menu_keyboard(), block_key="jobs")
 
 @dp.callback_query(F.data.startswith("do_merch:"))
 async def cb_do_merch(callback: CallbackQuery):
@@ -2028,7 +2122,7 @@ async def cb_do_merch(callback: CallbackQuery):
 
     is_in_jail, jail_msg = await check_jail(user_id)
     if is_in_jail:
-        await callback.message.edit_text(jail_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]))
+        await show_screen(callback, jail_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]]), block_key="jobs")
         return
 
     now = datetime.utcnow()
@@ -2076,7 +2170,7 @@ async def cb_do_merch(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 К работам", callback_data="jobs_menu")],
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]
     ])
-    await callback.message.edit_text(res_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, res_text, reply_markup=kb, block_key="jobs")
 
 # ==================== MATCHMAKING & BEAUTIFUL DYNAMIC GAME ====================
 @dp.callback_query(F.data == "search_game")
@@ -2427,7 +2521,7 @@ async def cb_leaderboard(callback: CallbackQuery):
         text += "Пока нет сыгранных матчей."
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")]])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=kb, block_key="leaderboard")
 
 # ==================== PACKS & SHOP ====================
 @dp.callback_query(F.data == "pack_shop")
@@ -2446,7 +2540,7 @@ async def cb_pack_shop(callback: CallbackQuery):
         buttons.append([InlineKeyboardButton(text=f"📦 {p['name']} — {p['price']} RPL", callback_data=f"buy_pack:{p['id']}")])
     buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_main")])
 
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML)
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), block_key="packs")
 
 @dp.callback_query(F.data.startswith("buy_pack:"))
 async def cb_buy_pack(callback: CallbackQuery):
@@ -2480,24 +2574,20 @@ async def cb_buy_pack(callback: CallbackQuery):
             WHERE c.id = $1
         """, chosen_id)
 
-        await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1 WHERE user_id = $2", pack["price"], user_id)
+        # Award card and +50 XP
+        await conn.execute("UPDATE users SET rpl_coins = rpl_coins - $1, exp = exp + 50 WHERE user_id = $2", pack["price"], user_id)
         await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, chosen_id)
 
+    formatted_drop = format_card_drop(dict(card))
     caption = (
         f"🎉 <b>ВЫ ОТКРЫЛИ {html.escape(pack['name'])}!</b>\n\n"
-        f"🌟 <b>{html.escape(card['name'])}</b> (OVR: {card['ovr']})\n"
-        f"Позиция: <b>{html.escape(card['position'])}</b> | Редкость: <b>{html.escape(card['rarity'])}</b>\n"
-        f"Команда: <b>{html.escape(card['team_name'])}</b>"
+        f"{formatted_drop}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Еще паки", callback_data="pack_shop")],
         [InlineKeyboardButton(text="🔙 В меню", callback_data="back_main")]
     ])
-    if card["effective_photo"]:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=card["effective_photo"], caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
-    else:
-        await callback.message.edit_text(caption, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await show_screen(callback, caption, reply_markup=kb, direct_photo=card["effective_photo"])
 
 # ==================== PROMO CODES ====================
 @dp.callback_query(F.data == "enter_promo")
@@ -2512,6 +2602,7 @@ async def cb_enter_promo(callback: CallbackQuery, state: FSMContext):
 async def process_user_promo(message: Message, state: FSMContext):
     code = message.text.strip().upper()
     user_id = message.from_user.id
+    reward_photo = None
 
     async with db.pool.acquire() as conn:
         promo = await conn.fetchrow("SELECT * FROM promo_codes WHERE code = $1", code)
@@ -2538,15 +2629,26 @@ async def process_user_promo(message: Message, state: FSMContext):
             await conn.execute("UPDATE users SET rpl_coins = rpl_coins + $1 WHERE user_id = $2", promo["reward_value"], user_id)
             res_text = f"🎉 Промокод активирован! Вы получили <b>{promo['reward_value']} RPLCoin</b>!"
         else:
-            card = await conn.fetchrow("SELECT name, ovr FROM cards WHERE id = $1", promo["reward_value"])
+            card = await conn.fetchrow("""
+                SELECT c.*, COALESCE(c.photo_id, t.photo_id) AS effective_photo
+                FROM cards c
+                LEFT JOIN teams t ON c.team_name = t.name
+                WHERE c.id = $1
+            """, promo["reward_value"])
             has_c = await conn.fetchrow("SELECT 1 FROM user_cards WHERE user_id = $1 AND card_id = $2", user_id, promo["reward_value"])
             if not has_c:
                 await conn.execute("INSERT INTO user_cards (user_id, card_id) VALUES ($1, $2)", user_id, promo["reward_value"])
-            card_title = f"{html.escape(card['name'])} (OVR {card['ovr']})" if card else f"Карточка #{promo['reward_value']}"
-            res_text = f"🎉 Промокод активирован! Вы получили: <b>{card_title}</b>!"
+                await conn.execute("UPDATE users SET exp = exp + 50 WHERE user_id = $1", user_id)
+
+            if card:
+                reward_photo = card["effective_photo"]
+                res_text = f"🎉 <b>Промокод активирован!</b>\n\n{format_card_drop(dict(card))}"
+            else:
+                res_text = f"🎉 Промокод активирован! Вы получили карточку #{promo['reward_value']}!"
 
     await state.clear()
-    await message.answer(res_text, reply_markup=main_menu_keyboard(message.chat.type == ChatType.PRIVATE), parse_mode=ParseMode.HTML)
+    kb = main_menu_keyboard(message.chat.type == ChatType.PRIVATE)
+    await show_screen(message, res_text, reply_markup=kb, direct_photo=reward_photo)
 
 # ==================== ADMIN PANEL (/adminrpl) ====================
 @dp.message(Command("adminrpl"))
@@ -2561,7 +2663,103 @@ async def cb_admin_panel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if callback.from_user.id not in ADMIN_IDS:
         return
-    await callback.message.edit_text("⚙️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА RPL</b>\nВыберите действие:", reply_markup=admin_main_keyboard(), parse_mode=ParseMode.HTML)
+    await show_screen(callback, "⚙️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА RPL</b>\nВыберите действие:", reply_markup=admin_main_keyboard())
+
+# --- Admin: Manage UI Section Photos ("Блоки") ---
+@dp.callback_query(F.data == "adm_blocks")
+async def cb_adm_blocks(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+
+    async with db.pool.acquire() as conn:
+        configured = await conn.fetch("SELECT block_key, photo_id FROM ui_blocks")
+        cfg_map = {row["block_key"]: bool(row["photo_id"]) for row in configured}
+
+    text = (
+        "🖼 <b>УПРАВЛЕНИЕ ФОТОГРАФИЯМИ БЛОКОВ (РАЗДЕЛОВ)</b>\n\n"
+        "Здесь вы можете прикрепить баннер/фото для каждого раздела меню бота.\n"
+        "Когда игрок переходит в этот раздел, бот прикрепит соответствующее фото!\n\n"
+        "Выберите раздел для настройки:"
+    )
+
+    buttons = []
+    for b_key, b_title in AVAILABLE_BLOCKS.items():
+        status = "✅ Есть фото" if cfg_map.get(b_key) else "❌ Без фото"
+        buttons.append([InlineKeyboardButton(text=f"{b_title} [{status}]", callback_data=f"adm_edit_block:{b_key}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 В админ-панель", callback_data="admin_panel")])
+    await show_screen(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("adm_edit_block:"))
+async def cb_adm_edit_block(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+
+    b_key = callback.data.split("adm_edit_block:")[1]
+    b_title = AVAILABLE_BLOCKS.get(b_key, b_key)
+    current_photo = await get_block_photo(b_key)
+
+    await state.update_data(editing_block=b_key)
+    await state.set_state(AdminBlockState.waiting_photo)
+
+    status_str = "Установлено (отправьте новое фото для замены)" if current_photo else "Не установлено"
+    text = (
+        f"🖼 <b>НАСТРОЙКА БЛОКА:</b> {b_title}\n"
+        f"Текущее состояние: <b>{status_str}</b>\n\n"
+        f"📸 <b>Отправьте фотографию</b>, которую бот будет показывать в этом разделе.\n"
+        f"Или нажмите кнопку «Удалить фото», чтобы сбросить баннер."
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить фото раздела", callback_data=f"adm_del_block:{b_key}")],
+        [InlineKeyboardButton(text="🔙 Назад к разделам", callback_data="adm_blocks")]
+    ])
+    await show_screen(callback, text, reply_markup=kb, direct_photo=current_photo)
+
+@dp.callback_query(F.data.startswith("adm_del_block:"))
+async def cb_adm_del_block(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+
+    b_key = callback.data.split("adm_del_block:")[1]
+    async with db.pool.acquire() as conn:
+        await conn.execute("DELETE FROM ui_blocks WHERE block_key = $1", b_key)
+
+    await state.clear()
+    await callback.answer("✅ Фото раздела успешно удалено!", show_alert=True)
+    await cb_adm_blocks(callback, state)
+
+@dp.message(AdminBlockState.waiting_photo, F.photo)
+async def process_adm_block_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    b_key = data.get("editing_block")
+
+    if not b_key or b_key not in AVAILABLE_BLOCKS:
+        await message.answer("❌ Ошибка: раздел не найден!")
+        await state.clear()
+        return
+
+    async with db.pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO ui_blocks (block_key, photo_id)
+            VALUES ($1, $2)
+            ON CONFLICT (block_key) DO UPDATE SET photo_id = $2
+        """, b_key, photo_id)
+
+    b_title = AVAILABLE_BLOCKS[b_key]
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Настроить еще разделы", callback_data="adm_blocks")],
+        [InlineKeyboardButton(text="⚙️ В админ-панель", callback_data="admin_panel")]
+    ])
+    await message.answer_photo(
+        photo=photo_id,
+        caption=f"✅ <b>Фотография для раздела «{b_title}» успешно сохранена!</b>\nТеперь этот баннер отображается всем игрокам при открытии раздела.",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
 
 # --- Admin: Setup Starter Players by IDs ---
 @dp.callback_query(F.data == "adm_starters")
@@ -2584,7 +2782,7 @@ async def cb_adm_starters(callback: CallbackQuery, state: FSMContext):
     st_text += "\nОтправьте <b>ID 5 карточек через запятую</b> (4 полевых и 1 вратарь), которые будут стартовым набором:\n<i>Пример: 1, 2, 3, 4, 5</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]])
-    await callback.message.edit_text(st_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await show_screen(callback, st_text, reply_markup=kb)
 
 @dp.message(AdminStartersState.card_ids)
 async def process_starters_ids(message: Message, state: FSMContext):
@@ -2625,7 +2823,7 @@ async def cb_adm_batch(callback: CallbackQuery, state: FSMContext):
         "Овечкин 8 | Легендарная | 🇷🇺 Россия | 95 | Skater | 1 | 1</code>\n\n"
         "<i>Фото карточки автоматически возьмется от команды (по ID Команды)!</i>"
     )
-    await callback.message.edit_text(instructions, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, instructions, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminBatchCard.waiting_for_text)
 async def process_batch_text(message: Message, state: FSMContext):
@@ -2710,7 +2908,7 @@ async def cb_adm_manual(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         return
     await state.set_state(AdminCardManual.name)
-    await callback.message.edit_text("📝 <b>РУЧНОЕ СОЗДАНИЕ КАРТОЧКИ</b>\nВведите имя игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, "📝 <b>РУЧНОЕ СОЗДАНИЕ КАРТОЧКИ</b>\nВведите имя игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCardManual.name)
 async def process_man_name(message: Message, state: FSMContext):
@@ -2727,14 +2925,14 @@ async def process_man_rarity(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminCardManual.country)
     buttons = [[InlineKeyboardButton(text=c, callback_data=f"man_c:{c}")] for c in CIS_COUNTRIES]
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
-    await callback.message.edit_text("Выберите страну игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await show_screen(callback, "Выберите страну игрока:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.country, F.data.startswith("man_c:"))
 async def process_man_country(callback: CallbackQuery, state: FSMContext):
     country = callback.data.split("man_c:")[1]
     await state.update_data(country=country)
     await state.set_state(AdminCardManual.ovr)
-    await callback.message.edit_text("Введите OVR карточки (50 - 99):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, "Введите OVR карточки (50 - 99):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCardManual.ovr)
 async def process_man_ovr(message: Message, state: FSMContext):
@@ -2761,7 +2959,7 @@ async def process_man_position(callback: CallbackQuery, state: FSMContext):
     for t in teams:
         buttons.append([InlineKeyboardButton(text=t["name"], callback_data=f"man_t:{t['name']}")])
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
-    await callback.message.edit_text("Выберите команду:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await show_screen(callback, "Выберите команду:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.team, F.data.startswith("man_t:"))
 async def process_man_team(callback: CallbackQuery, state: FSMContext):
@@ -2774,7 +2972,7 @@ async def process_man_team(callback: CallbackQuery, state: FSMContext):
     for c in cols:
         buttons.append([InlineKeyboardButton(text=c["name"], callback_data=f"man_col:{c['name']}")])
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="admin_panel")])
-    await callback.message.edit_text("Выберите коллекцию:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await show_screen(callback, "Выберите коллекцию:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(AdminCardManual.collection, F.data.startswith("man_col:"))
 async def process_man_collection(callback: CallbackQuery, state: FSMContext):
@@ -2786,7 +2984,7 @@ async def process_man_collection(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="Нет, обычная", callback_data="man_s:0")],
         [InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]
     ])
-    await callback.message.edit_text("Выдавать эту карту новичкам при старте?", reply_markup=kb)
+    await show_screen(callback, "Выдавать эту карту новичкам при старте?", reply_markup=kb)
 
 @dp.callback_query(AdminCardManual.is_starter, F.data.startswith("man_s:"))
 async def process_man_starter(callback: CallbackQuery, state: FSMContext):
@@ -2801,11 +2999,11 @@ async def process_man_starter(callback: CallbackQuery, state: FSMContext):
         """, data["name"], data["rarity"], data["country"], data["ovr"], data["position"], data["team_name"], data["collection_name"], is_starter)
 
     await state.clear()
-    await callback.message.edit_text(
+    await show_screen(
+        callback,
         f"✅ Карточка <b>{html.escape(data['name'])}</b> создана! ID: <b>#{row['id']}</b>\n"
         f"Фото будет автоматически отображаться из команды <b>{html.escape(data['team_name'])}</b>.",
-        reply_markup=admin_main_keyboard(),
-        parse_mode=ParseMode.HTML
+        reply_markup=admin_main_keyboard()
     )
 
 # --- Admin: Teams Management ---
@@ -2822,7 +3020,7 @@ async def cb_adm_teams(callback: CallbackQuery, state: FSMContext):
     t_text += "\nОтправьте <b>название новой команды</b>:"
 
     await state.set_state(AdminTeamState.team_name)
-    await callback.message.edit_text(t_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, t_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminTeamState.team_name)
 async def process_adm_team_name(message: Message, state: FSMContext):
@@ -2869,8 +3067,7 @@ async def cb_adm_collections(callback: CallbackQuery, state: FSMContext):
     c_text += "\nОтправьте название новой коллекции для добавления:"
 
     await state.set_state(AdminCollectionState.collection_name)
-    await callback.message.edit_text(c_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]])
-    )
+    await show_screen(callback, c_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminCollectionState.collection_name)
 async def process_adm_col(message: Message, state: FSMContext):
@@ -2884,7 +3081,7 @@ async def process_adm_col(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_packs")
 async def cb_adm_packs(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminPackState.name)
-    await callback.message.edit_text("Введите название пака:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, "Введите название пака:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPackState.name)
 async def process_pack_name(message: Message, state: FSMContext):
@@ -2922,7 +3119,7 @@ async def process_pack_cards(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "adm_promo")
 async def cb_adm_promo(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminPromoState.code)
-    await callback.message.edit_text("Введите код нового промокода (например: RPLOVE):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, "Введите код нового промокода (например: RPLOVE):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPromoState.code)
 async def process_promo_code(message: Message, state: FSMContext):
@@ -2941,7 +3138,7 @@ async def process_promo_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(reward_type=rw)
     await state.set_state(AdminPromoState.reward_value)
     prompt = "Введите количество монет:" if rw == "money" else "Введите ID карточки для выдачи:"
-    await callback.message.edit_text(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
+    await show_screen(callback, prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", callback_data="admin_panel")]]))
 
 @dp.message(AdminPromoState.reward_value)
 async def process_promo_val(message: Message, state: FSMContext):
